@@ -478,28 +478,20 @@ impl<'a> R<'a> {
         }
         use syntect::easy::HighlightLines;
         use syntect::util::LinesWithEndings;
-        let syntax = lang
+        let token = lang
             .as_deref()
-            .and_then(|l| self.opts.syntaxes.find_syntax_by_token(l))
+            .and_then(|l| l.split(|c: char| c.is_whitespace() || c == ',').find(|t| !t.is_empty()));
+        let syntax = token
+            .and_then(|t| self.opts.syntaxes.find_syntax_by_token(t))
             .unwrap_or_else(|| self.opts.syntaxes.find_syntax_plain_text());
         let mut h = HighlightLines::new(syntax, &self.opts.theme);
-        let mut any = false;
         for line in LinesWithEndings::from(&code) {
             let rendered = match h.highlight_line(line, &self.opts.syntaxes) {
-                Ok(ranges) => {
-                    let mut s = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
-                    while s.ends_with('\n') || s.ends_with('\r') {
-                        s.pop();
-                    }
-                    s
-                }
-                Err(_) => line.trim_end_matches(['\n', '\r']).to_string(),
+                Ok(ranges) => syntect::util::as_24_bit_terminal_escaped(&ranges[..], false),
+                Err(_) => line.to_string(),
             };
-            any = true;
-            self.out.push(Line { text: format!("{pad}{rendered}"), live: false });
-        }
-        if !any && !code.is_empty() {
-            self.out.push(Line { text: pad, live: false });
+            let rendered = rendered.trim_end_matches(['\n', '\r']);
+            self.out.push(Line { text: format!("{pad}{rendered}{RESET}"), live: false });
         }
     }
 
@@ -770,5 +762,30 @@ mod tests {
         let o = RenderOpts::new(true, 80, false, "base16-ocean.dark");
         let out = render("```rust\nfn main() {}\n```", &o, true);
         assert!(!out.iter().any(|l| l.text.contains("\u{1b}[38;2;")));
+    }
+
+    #[test]
+    fn highlighted_code_resets_color() {
+        let o = RenderOpts::new(true, 80, true, "base16-ocean.dark");
+        let out = render("```rust\nfn main() {}\n```\n\nafter", &o, true);
+        let code_line = out.iter().find(|l| l.text.contains("\u{1b}[38;2;")).unwrap();
+        assert!(code_line.text.ends_with("\u{1b}[0m"), "code must end with reset: {:?}", code_line.text);
+        let after = out.iter().find(|l| l.text.contains("after")).unwrap();
+        assert!(!after.text.contains("\u{1b}[38;2;"), "color leaked: {:?}", after.text);
+    }
+
+    #[test]
+    fn highlighted_code_respects_language_attributes() {
+        let o = RenderOpts::new(true, 80, true, "base16-ocean.dark");
+        let out = render("```rust,ignore\nfn main() {}\n```", &o, true);
+        assert!(out.iter().any(|l| l.text.contains("\u{1b}[38;2;")));
+    }
+
+    #[test]
+    fn highlighted_multiline_code() {
+        let o = RenderOpts::new(true, 80, true, "base16-ocean.dark");
+        let out = render("```rust\nlet a = 1;\nlet b = 2;\n```", &o, true);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|l| l.text.ends_with("\u{1b}[0m")));
     }
 }
