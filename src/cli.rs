@@ -24,6 +24,13 @@ fn take_value(
     }
 }
 
+fn take_flag(inline: Option<String>, key: &str) -> Result<(), String> {
+    match inline {
+        Some(_) => Err(format!("unexpected value for {key}")),
+        None => Ok(()),
+    }
+}
+
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, String> {
     let mut cfg = Config {
         color: ColorMode::Auto,
@@ -54,9 +61,18 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
                 cfg.width = Some(v.parse().map_err(|_| format!("invalid width: {v}"))?);
             }
             "--theme" => cfg.theme = take_value(&mut it, inline, &key)?,
-            "--no-highlight" => cfg.highlight = false,
-            "-h" | "--help" => cfg.help = true,
-            "-V" | "--version" => cfg.version = true,
+            "--no-highlight" => {
+                take_flag(inline, &key)?;
+                cfg.highlight = false;
+            }
+            "-h" | "--help" => {
+                take_flag(inline, &key)?;
+                cfg.help = true;
+            }
+            "-V" | "--version" => {
+                take_flag(inline, &key)?;
+                cfg.version = true;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -107,5 +123,19 @@ mod tests {
         assert!(p(&["--color", "blue"]).is_err());
         assert!(p(&["--width", "abc"]).is_err());
         assert!(p(&["--width"]).is_err());
+    }
+
+    #[test]
+    fn rejects_value_on_boolean_flags() {
+        assert!(p(&["--no-highlight=false"]).is_err());
+        assert!(p(&["--help=x"]).is_err());
+        assert!(p(&["--version=x"]).is_err());
+    }
+
+    #[test]
+    fn long_flags_and_value_with_equals() {
+        assert!(p(&["--help"]).unwrap().help);
+        assert!(p(&["--version"]).unwrap().version);
+        assert_eq!(p(&["--theme=a=b"]).unwrap().theme, "a=b");
     }
 }
