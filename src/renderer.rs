@@ -141,7 +141,6 @@ fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>>
         } else {
             if !cur.is_empty() {
                 rows.push(std::mem::take(&mut cur));
-                cur_w = 0;
             }
             let mut ww = 0usize;
             for &(c, st) in word {
@@ -555,11 +554,11 @@ impl<'a> R<'a> {
             let mut s = String::new();
             s.push_str(&q);
             s.push('│');
-            for i in 0..ncols {
+            for (i, width) in widths.iter().enumerate() {
                 let empty = String::new();
                 let cell = row.get(i).unwrap_or(&empty);
                 let w = UnicodeWidthStr::width(cell.as_str());
-                let pad = widths[i].saturating_sub(w);
+                let pad = width.saturating_sub(w);
                 let (lp, rp) = match aligns.get(i) {
                     Some(Alignment::Right) => (pad, 0),
                     Some(Alignment::Center) => (pad / 2, pad - pad / 2),

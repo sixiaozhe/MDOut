@@ -68,6 +68,7 @@ impl<W: Write> Terminal<W> {
         self.width_override.unwrap_or_else(detect_width)
     }
 
+    #[allow(dead_code)]
     pub fn into_inner(self) -> W {
         self.out
     }

@@ -48,3 +48,65 @@ fn bad_argument_exits_two() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+fn run_cmd(args: &[&str], env: &[(&str, &str)], input: &[u8]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdout"));
+    cmd.args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn color_always_beats_no_color_env() {
+    let out = run_cmd(&["--color=always"], &[("NO_COLOR", "1")], b"**bold**\n");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\u{1b}[1m"));
+}
+
+#[test]
+fn auto_color_honors_no_color_env() {
+    let out = run_cmd(&[], &[("NO_COLOR", "1")], b"**bold**\n");
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains('\u{1b}'));
+}
+
+#[test]
+fn width_option_wraps_output() {
+    let out = run_cmd(&["--width", "10"], &[], b"one two three four five six\n");
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.lines().count() >= 2, "expected wrapping: {s:?}");
+    assert!(s.lines().all(|l| l.len() <= 10), "line exceeded width: {s:?}");
+}
+
+#[test]
+fn version_exits_zero() {
+    let out = run_cmd(&["--version"], &[], b"");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("mdout"));
+}
+
+#[test]
+fn bad_argument_writes_usage_to_stderr() {
+    let out = run_cmd(&["--nope"], &[], b"");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Usage"));
+}
+
+#[test]
+fn help_survives_closed_pipe() {
+    let bin = env!("CARGO_BIN_EXE_mdout");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("\"{bin}\" --help | true"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "--help should not fail on a closed pipe");
+}

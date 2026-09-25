@@ -5,7 +5,7 @@ mod parser;
 mod renderer;
 mod terminal;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -19,12 +19,10 @@ fn main() -> ExitCode {
         }
     };
     if cfg.help {
-        println!("{}", cli::USAGE);
-        return ExitCode::SUCCESS;
+        return write_message(cli::USAGE);
     }
     if cfg.version {
-        println!("mdout {}", env!("CARGO_PKG_VERSION"));
-        return ExitCode::SUCCESS;
+        return write_message(&format!("mdout {}", env!("CARGO_PKG_VERSION")));
     }
     let tty = std::io::stdout().is_terminal();
     let color = match cfg.color {
@@ -40,4 +38,15 @@ fn main() -> ExitCode {
         redraw: tty,
     });
     ExitCode::from(code)
+}
+
+fn write_message(msg: &str) -> ExitCode {
+    match writeln!(std::io::stdout(), "{msg}") {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("mdout: write error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
