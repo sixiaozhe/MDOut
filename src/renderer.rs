@@ -195,8 +195,11 @@ fn heading_num(level: HeadingLevel) -> usize {
 }
 
 fn ends_with_blank(md: &str) -> bool {
-    let t = md.trim_end_matches([' ', '\t']);
-    t.is_empty() || t.ends_with("\n\n")
+    let mut lines = md.split('\n').rev();
+    let last = lines.next();
+    let prev = lines.next();
+    let blank = |s: Option<&str>| s.map_or(true, |l| l.trim().is_empty());
+    blank(last) && blank(prev)
 }
 
 struct ListCtx {
@@ -847,5 +850,40 @@ mod tests {
             "│ 中文 │ abc   │",
             "└──────┴───────┘",
         ]);
+    }
+
+    #[test]
+    fn last_block_is_live_until_blank_line() {
+        let o = opts(false, 80);
+        let lines = render("hello", &o, false);
+        assert!(lines.iter().all(|l| l.live));
+        let lines = render("hello\n\n", &o, false);
+        assert!(lines.iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn final_flush_marks_everything_stable() {
+        let o = opts(false, 80);
+        let lines = render("hello", &o, true);
+        assert!(lines.iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn whitespace_only_blank_line_closes_block() {
+        let o = opts(false, 80);
+        assert!(render("hello\n \n", &o, false).iter().all(|l| !l.live));
+        assert!(render("hello\n", &o, false).iter().all(|l| l.live));
+    }
+
+    #[test]
+    fn chunk_boundary_invariance() {
+        let md = "# 标题\n\n这是 **中文** 段落。\n\n- a\n- b\n\n```rust\nfn main() {}\n```\n";
+        let o = opts(false, 40);
+        let expected = render(md, &o, true);
+        for (i, _) in md.char_indices() {
+            let prefix = &md[..i];
+            let _ = render(prefix, &o, false);
+        }
+        assert_eq!(render(md, &o, true), expected);
     }
 }
