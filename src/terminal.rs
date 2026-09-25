@@ -75,7 +75,18 @@ impl<W: Write> Terminal<W> {
     pub fn draw(&mut self, lines: &[Line]) -> io::Result<()> {
         if self.redraw {
             write!(self.out, "\x1b[?25l")?;
+            let res = self.draw_body(lines);
+            let _ = write!(self.out, "\x1b[?25h");
+            self.out.flush()?;
+            res
+        } else {
+            let res = self.draw_body(lines);
+            self.out.flush()?;
+            res
         }
+    }
+
+    fn draw_body(&mut self, lines: &[Line]) -> io::Result<()> {
         if self.redraw && self.prev_rows > 0 {
             write!(self.out, "{}", erase_live(self.prev_rows))?;
             self.prev_rows = 0;
@@ -94,9 +105,8 @@ impl<W: Write> Terminal<W> {
                 writeln!(self.out, "{}", line.text)?;
                 self.prev_rows += rows_for_line(&line.text, width);
             }
-            write!(self.out, "\x1b[?25h")?;
         }
-        self.out.flush()
+        Ok(())
     }
 
     pub fn finish(&mut self, lines: &[Line]) -> io::Result<()> {
