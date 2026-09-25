@@ -1,3 +1,4 @@
+use std::io;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,25 @@ pub struct RunConfig {
     pub redraw: bool,
 }
 
+enum WriteOutcome {
+    Ok,
+    Broken,
+    Failed,
+}
+
+fn classify(res: io::Result<()>) -> WriteOutcome {
+    match res {
+        Ok(()) => WriteOutcome::Ok,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => WriteOutcome::Broken,
+        Err(e) => {
+            eprintln!("mdout: write error: {e}");
+            WriteOutcome::Failed
+        }
+    }
+}
+
 pub fn run(cfg: RunConfig) -> u8 {
+    let auto_width = cfg.width.is_none();
     let mut opts = RenderOpts::new(
         cfg.color,
         cfg.width.unwrap_or_else(terminal::detect_width),
@@ -27,7 +46,6 @@ pub fn run(cfg: RunConfig) -> u8 {
     let mut buf = String::new();
     let mut dirty = false;
     let mut had_error = false;
-    let mut broken_pipe = false;
 
     loop {
         match rx.recv_timeout(debounce) {
@@ -35,15 +53,17 @@ pub fn run(cfg: RunConfig) -> u8 {
                 buf.push_str(&s);
                 dirty = true;
                 if last.elapsed() >= debounce {
-                    if cfg.width.is_none() {
+                    if auto_width {
                         opts.width = term.width();
                     }
-                    if term.draw(&renderer::render(&buf, &opts, false)).is_err() {
-                        broken_pipe = true;
-                        break;
+                    match classify(term.draw(&renderer::render(&buf, &opts, false))) {
+                        WriteOutcome::Ok => {
+                            last = Instant::now();
+                            dirty = false;
+                        }
+                        WriteOutcome::Broken => return 0,
+                        WriteOutcome::Failed => return 1,
                     }
-                    last = Instant::now();
-                    dirty = false;
                 }
             }
             Ok(InputMsg::Eof) => break,
@@ -54,30 +74,31 @@ pub fn run(cfg: RunConfig) -> u8 {
             }
             Err(RecvTimeoutError::Timeout) => {
                 if dirty {
-                    if cfg.width.is_none() {
+                    if auto_width {
                         opts.width = term.width();
                     }
-                    if term.draw(&renderer::render(&buf, &opts, false)).is_err() {
-                        broken_pipe = true;
-                        break;
+                    match classify(term.draw(&renderer::render(&buf, &opts, false))) {
+                        WriteOutcome::Ok => {
+                            last = Instant::now();
+                            dirty = false;
+                        }
+                        WriteOutcome::Broken => return 0,
+                        WriteOutcome::Failed => return 1,
                     }
-                    last = Instant::now();
-                    dirty = false;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    if broken_pipe {
-        return 0;
-    }
-    if cfg.width.is_none() {
+    if auto_width {
         opts.width = term.width();
     }
     let final_lines = renderer::render(&buf, &opts, true);
-    if term.finish(&final_lines).is_err() {
-        return 0;
+    match classify(term.finish(&final_lines)) {
+        WriteOutcome::Ok => {}
+        WriteOutcome::Broken => return 0,
+        WriteOutcome::Failed => return 1,
     }
     if had_error { 1 } else { 0 }
 }
