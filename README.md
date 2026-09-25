@@ -38,6 +38,19 @@ $ llm --stream "解释一下 TCP 三次握手" | mdout
 
 ## 安装
 
+### 下载预编译二进制
+
+仓库内提供 x86_64 Linux 的 musl 静态单文件（零共享库依赖）：
+
+```bash
+cd dist
+sha256sum -c mdout-0.1.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar xzf mdout-0.1.0-x86_64-unknown-linux-musl.tar.gz
+sudo install -m755 mdout-0.1.0-x86_64-unknown-linux-musl/mdout /usr/local/bin/mdout
+```
+
+### 从源码构建
+
 从源码构建：
 
 ```bash
