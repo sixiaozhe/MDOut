@@ -712,4 +712,14 @@ mod tests {
     fn list_continuation_is_indented() {
         assert_eq!(plain("- one two three", 8), vec!["• one", "  two", "  three"]);
     }
+
+    #[test]
+    fn ordered_list_custom_start() {
+        assert_eq!(plain("3. a\n4. b", 80), vec!["3. a", "4. b"]);
+    }
+
+    #[test]
+    fn horizontal_rule_width_one() {
+        assert_eq!(plain("---", 1), vec!["─"]);
+    }
 }
