@@ -1353,16 +1353,44 @@ git commit -m "feat: fenced code blocks with syntect highlighting"
             assert_eq!(UnicodeWidthStr::width(l.as_str()), UnicodeWidthStr::width(out[0].as_str()));
         }
     }
+
+    #[test]
+    fn applies_column_alignment() {
+        let md = "| left | center | right |\n| :--- | :---: | ---: |\n| a | b | c |";
+        let out = plain(md, 80);
+        assert!(out[3].starts_with("│ a "), "left column: {:?}", out[3]);
+        assert!(out[3].ends_with("c │"), "right column: {:?}", out[3]);
+        assert!(out[3].find('b').unwrap() > 6, "center column: {:?}", out[3]);
+    }
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `cargo test renderer::`
-Expected: 表格相关 FAIL（Task 4 中的 `emit_table` 可能需要按 `aligns` 修正列数、或 `table_event` 未正确进入表格状态）。
+Expected: 表格相关 FAIL（`applies_column_alignment` 因当前 `emit_table` 忽略 `Alignment` 而失败）。
 
 - [ ] **Step 3: 修正实现**
 
-确认 `event()` 中 `if self.table.is_some()` 分支在 `Tag::Table` Start 之后生效；`emit_table` 的列宽用 `UnicodeWidthStr::width` 计算并按列补空格。中英混排单元格显示宽度由 `unicode-width` 保证（中文计 2、ASCII 计 1），断言各行显示宽度一致。
+确认 `event()` 中 `if self.table.is_some()` 分支在 `Tag::Table` Start 之后生效；`emit_table` 的列宽用 `UnicodeWidthStr::width` 计算。中英混排单元格显示宽度由 `unicode-width` 保证（中文计 2、ASCII 计 1），断言各行显示宽度一致。
+
+同时实现 GFM 列对齐：`TableState.aligns` 已保存 `Tag::Table(aligns)` 的 `Vec<Alignment>`，在 `emit_table` 的 `rowstr` 闭包中按列应用：
+
+```rust
+                let pad = widths[i].saturating_sub(w);
+                let (lp, rp) = match t.aligns.get(i) {
+                    Some(Alignment::Right) => (pad, 0),
+                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                    _ => (0, pad),
+                };
+                s.push(' ');
+                s.push_str(&" ".repeat(lp));
+                s.push_str(cell);
+                s.push_str(&" ".repeat(rp));
+                s.push(' ');
+                s.push('│');
+```
+
+（`rowstr` 需捕获 `t.aligns`；若 `t` 已被 `emit_table` 顶部 `self.table.take()` 取为局部变量，则闭包直接借用该局部量即可。）
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -1747,10 +1775,9 @@ fn main() -> ExitCode {
         cli::ColorMode::Never => false,
         cli::ColorMode::Auto => tty && std::env::var_os("NO_COLOR").is_none(),
     };
-    let width = cfg.width.unwrap_or_else(terminal::detect_width);
     let code = app::run(app::RunConfig {
         color,
-        width,
+        width: cfg.width,
         highlight: cfg.highlight,
         theme: cfg.theme,
         redraw: tty,
