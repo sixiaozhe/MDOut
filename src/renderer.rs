@@ -196,10 +196,8 @@ fn heading_num(level: HeadingLevel) -> usize {
 
 fn ends_with_blank(md: &str) -> bool {
     let mut lines = md.split('\n').rev();
-    let last = lines.next();
-    let prev = lines.next();
-    let blank = |s: Option<&str>| s.map_or(true, |l| l.trim().is_empty());
-    blank(last) && blank(prev)
+    let blank = |s: Option<&str>| s.is_none_or(|l| l.trim_matches([' ', '\t', '\r']).is_empty());
+    blank(lines.next()) && blank(lines.next())
 }
 
 struct ListCtx {
@@ -879,11 +877,41 @@ mod tests {
     fn chunk_boundary_invariance() {
         let md = "# 标题\n\n这是 **中文** 段落。\n\n- a\n- b\n\n```rust\nfn main() {}\n```\n";
         let o = opts(false, 40);
-        let expected = render(md, &o, true);
+        let final_lines = render(md, &o, true);
         for (i, _) in md.char_indices() {
-            let prefix = &md[..i];
-            let _ = render(prefix, &o, false);
+            let inc = render(&md[..i], &o, false);
+            let stable: Vec<&Line> = inc.iter().filter(|l| !l.live).collect();
+            for (k, l) in stable.iter().enumerate() {
+                assert_eq!(
+                    Some(&l.text),
+                    final_lines.get(k).map(|f| &f.text),
+                    "stable prefix diverged at chunk {i}, line {k}"
+                );
+            }
         }
-        assert_eq!(render(md, &o, true), expected);
+    }
+
+    #[test]
+    fn live_marking_for_non_paragraph_blocks() {
+        let o = opts(false, 80);
+        let table = "| a | b |\n| - | - |\n| 1 | 2 |";
+        assert!(render(table, &o, false).iter().all(|l| l.live));
+        let list = "- a\n- b";
+        assert!(render(list, &o, false).iter().all(|l| l.live));
+        let mixed = render("a\n\nb", &o, false);
+        assert!(mixed.iter().filter(|l| !l.live).count() >= 2);
+        assert!(mixed.last().unwrap().live);
+    }
+
+    #[test]
+    fn ends_with_blank_semantics() {
+        assert!(ends_with_blank(""));
+        assert!(ends_with_blank("  "));
+        assert!(ends_with_blank("hello\n\n"));
+        assert!(ends_with_blank("hello\n \n"));
+        assert!(ends_with_blank("hello\r\n\r\n"));
+        assert!(!ends_with_blank("hello"));
+        assert!(!ends_with_blank("hello\n"));
+        assert!(!ends_with_blank("hello\n\u{a0}\n"));
     }
 }
