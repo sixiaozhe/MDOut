@@ -463,14 +463,43 @@ impl<'a> R<'a> {
 
     fn emit_code_block(&mut self) {
         let code = std::mem::take(&mut self.code_buf);
-        let _ = self.code_lang.take();
+        let lang = self.code_lang.take();
         let pad = format!("{}    ", quote_prefix(self.quote_depth));
-        let body = code.strip_suffix('\n').unwrap_or(&code);
-        if body.is_empty() && code.is_empty() {
+        let use_highlight = self.opts.color && self.opts.highlight;
+        if !use_highlight {
+            let body = code.strip_suffix('\n').unwrap_or(&code);
+            if body.is_empty() && code.is_empty() {
+                return;
+            }
+            for line in body.split('\n') {
+                self.out.push(Line { text: format!("{pad}{line}"), live: false });
+            }
             return;
         }
-        for line in body.split('\n') {
-            self.out.push(Line { text: format!("{pad}{line}"), live: false });
+        use syntect::easy::HighlightLines;
+        use syntect::util::LinesWithEndings;
+        let syntax = lang
+            .as_deref()
+            .and_then(|l| self.opts.syntaxes.find_syntax_by_token(l))
+            .unwrap_or_else(|| self.opts.syntaxes.find_syntax_plain_text());
+        let mut h = HighlightLines::new(syntax, &self.opts.theme);
+        let mut any = false;
+        for line in LinesWithEndings::from(&code) {
+            let rendered = match h.highlight_line(line, &self.opts.syntaxes) {
+                Ok(ranges) => {
+                    let mut s = syntect::util::as_24_bit_terminal_escaped(&ranges[..], false);
+                    while s.ends_with('\n') || s.ends_with('\r') {
+                        s.pop();
+                    }
+                    s
+                }
+                Err(_) => line.trim_end_matches(['\n', '\r']).to_string(),
+            };
+            any = true;
+            self.out.push(Line { text: format!("{pad}{rendered}"), live: false });
+        }
+        if !any && !code.is_empty() {
+            self.out.push(Line { text: pad, live: false });
         }
     }
 
@@ -721,5 +750,25 @@ mod tests {
     #[test]
     fn horizontal_rule_width_one() {
         assert_eq!(plain("---", 1), vec!["─"]);
+    }
+
+    #[test]
+    fn renders_code_block_indented_plain() {
+        let out = plain("```\nfn main() {}\n```", 80);
+        assert_eq!(out, vec!["    fn main() {}"]);
+    }
+
+    #[test]
+    fn highlighted_code_uses_ansi() {
+        let o = RenderOpts::new(true, 80, true, "base16-ocean.dark");
+        let out = render("```rust\nfn main() {}\n```", &o, true);
+        assert!(out.iter().any(|l| l.text.contains("\u{1b}[38;2;")));
+    }
+
+    #[test]
+    fn no_highlight_option_keeps_plain() {
+        let o = RenderOpts::new(true, 80, false, "base16-ocean.dark");
+        let out = render("```rust\nfn main() {}\n```", &o, true);
+        assert!(!out.iter().any(|l| l.text.contains("\u{1b}[38;2;")));
     }
 }
