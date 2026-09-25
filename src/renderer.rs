@@ -321,6 +321,18 @@ impl<'a> R<'a> {
     }
 
     fn start(&mut self, tag: Tag) {
+        if matches!(
+            &tag,
+            Tag::Paragraph
+                | Tag::Heading { .. }
+                | Tag::BlockQuote(..)
+                | Tag::CodeBlock(_)
+                | Tag::List(_)
+                | Tag::Item
+                | Tag::Table(_)
+        ) {
+            self.emit_current();
+        }
         if self.depth == 0 {
             self.push_blank_separator();
             self.block_starts.push(self.out.len());
@@ -414,11 +426,15 @@ impl<'a> R<'a> {
     fn emit_heading(&mut self) {
         let content = std::mem::take(&mut self.cur);
         if !content.is_empty() {
-            let w = prefix_width(&content).min(self.opts.width).max(1);
-            let rows = wrap_widths(&to_chars(&content), self.opts.width);
+            let (first, cont) = self.prefixes();
+            let pw = prefix_width(&first).max(prefix_width(&cont));
+            let w = prefix_width(&content)
+                .min(self.opts.width.saturating_sub(pw))
+                .max(1);
+            let rows = wrap_with_prefix(&content, &first, &cont, self.opts.width);
             for row in rows {
                 self.out.push(Line {
-                    text: encode_line(&coalesce(&row), self.opts.color),
+                    text: encode_line(&row, self.opts.color),
                     live: false,
                 });
             }
@@ -429,9 +445,13 @@ impl<'a> R<'a> {
                     _ => None,
                 };
                 if let Some(ch) = ch {
-                    let sp = Span { text: ch.to_string().repeat(w), style: Style { dim: true, ..Style::default() } };
+                    let mut spans = cont.clone();
+                    spans.push(Span {
+                        text: ch.to_string().repeat(w),
+                        style: Style { dim: true, ..Style::default() },
+                    });
                     self.out.push(Line {
-                        text: encode_line(std::slice::from_ref(&sp), self.opts.color),
+                        text: encode_line(&spans, self.opts.color),
                         live: false,
                     });
                 }
@@ -651,5 +671,15 @@ mod tests {
     #[test]
     fn blank_line_separates_top_level_blocks() {
         assert_eq!(plain("a\n\nb", 80), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn nested_tight_list_keeps_structure() {
+        assert_eq!(plain("- a\n  - b", 80), vec!["• a", "  • b"]);
+    }
+
+    #[test]
+    fn heading_inside_blockquote_keeps_prefix() {
+        assert_eq!(plain("> # Hi", 80), vec!["│ Hi", "│ ══"]);
     }
 }
