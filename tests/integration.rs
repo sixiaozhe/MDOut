@@ -110,3 +110,23 @@ fn help_survives_closed_pipe() {
         .unwrap();
     assert!(status.success(), "--help should not fail on a closed pipe");
 }
+
+#[test]
+fn streaming_survives_closed_pipe() {
+    let bin = env!("CARGO_BIN_EXE_mdout");
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg(format!("set -o pipefail; \"{bin}\" | head -n1"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = String::new();
+    for i in 0..20000 {
+        input.push_str(&format!("block {i}\n\n"));
+    }
+    let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}

@@ -199,6 +199,56 @@ fn ends_with_blank(md: &str) -> bool {
     blank(lines.next()) && blank(lines.next())
 }
 
+fn is_atx_heading(line: &str) -> bool {
+    let hashes = line.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return false;
+    }
+    let rest = &line[hashes..];
+    rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t')
+}
+
+fn is_hr(line: &str) -> bool {
+    let mut chars = line.chars().filter(|c| *c != ' ');
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if first != '-' && first != '*' && first != '_' {
+        return false;
+    }
+    let mut count = 1;
+    for c in chars {
+        if c != first {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
+}
+
+fn trailing_block_closed(md: &str) -> bool {
+    if ends_with_blank(md) {
+        return true;
+    }
+    if !md.ends_with('\n') {
+        return false;
+    }
+    let last = match md.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(l) => l.trim(),
+        None => return true,
+    };
+    if is_atx_heading(last) || is_hr(last) {
+        return true;
+    }
+    if last.starts_with("```") || last.starts_with("~~~") {
+        let marker = &last[..3];
+        let fences = md.lines().filter(|l| l.trim_start().starts_with(marker)).count();
+        return fences % 2 == 0;
+    }
+    false
+}
+
 struct ListCtx {
     ordered: bool,
     next: u64,
@@ -629,7 +679,7 @@ impl<'a> R<'a> {
 
     fn finish_input(&mut self, final_flush: bool, md: &str) {
         self.emit_current();
-        if !final_flush && !ends_with_blank(md) {
+        if !final_flush && !trailing_block_closed(md) {
             if let Some(&start) = self.block_starts.last() {
                 let start = start.min(self.out.len());
                 for line in &mut self.out[start..] {
@@ -900,6 +950,22 @@ mod tests {
         let mixed = render("a\n\nb", &o, false);
         assert!(mixed.iter().filter(|l| !l.live).count() >= 2);
         assert!(mixed.last().unwrap().live);
+    }
+
+    #[test]
+    fn self_terminated_trailing_blocks_are_stable() {
+        let o = opts(false, 80);
+        assert!(render("```\nline\n```\n", &o, false).iter().all(|l| !l.live));
+        assert!(render("# T\n", &o, false).iter().all(|l| !l.live));
+        assert!(render("---\n", &o, false).iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn incomplete_trailing_blocks_stay_live() {
+        let o = opts(false, 80);
+        assert!(render("```\nline\n", &o, false).iter().all(|l| l.live));
+        assert!(render("# T", &o, false).iter().all(|l| l.live));
+        assert!(render("hello\n", &o, false).iter().all(|l| l.live));
     }
 
     #[test]
