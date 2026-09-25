@@ -549,6 +549,7 @@ impl<'a> R<'a> {
             }
             s
         };
+        let aligns = &t.aligns;
         let rowstr = |row: &[String]| -> String {
             let mut s = String::new();
             s.push_str(&q);
@@ -558,9 +559,15 @@ impl<'a> R<'a> {
                 let cell = row.get(i).unwrap_or(&empty);
                 let w = UnicodeWidthStr::width(cell.as_str());
                 let pad = widths[i].saturating_sub(w);
+                let (lp, rp) = match aligns.get(i) {
+                    Some(Alignment::Right) => (pad, 0),
+                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                    _ => (0, pad),
+                };
                 s.push(' ');
+                s.push_str(&" ".repeat(lp));
                 s.push_str(cell);
-                s.push_str(&" ".repeat(pad));
+                s.push_str(&" ".repeat(rp));
                 s.push(' ');
                 s.push('│');
             }
@@ -787,5 +794,46 @@ mod tests {
         let out = render("```rust\nlet a = 1;\nlet b = 2;\n```", &o, true);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|l| l.text.ends_with("\u{1b}[0m")));
+    }
+
+    #[test]
+    fn renders_table_borders_plain() {
+        let md = "| a | b |\n| - | - |\n| 1 | 2 |";
+        let out = plain(md, 80);
+        assert_eq!(out, vec![
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
+            "│ 1 │ 2 │",
+            "└───┴───┘",
+        ]);
+    }
+
+    #[test]
+    fn aligns_cjk_and_ascii_columns() {
+        let md = "| 名称 | value |\n| --- | --- |\n| 中文 | abc |";
+        let out = plain(md, 80);
+        let widths: Vec<usize> = out.iter().map(|l| UnicodeWidthStr::width(l.as_str())).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]));
+        assert!(out[1].contains("名称"));
+        assert!(out[3].contains("中文"));
+    }
+
+    #[test]
+    fn mixed_cjk_ascii_cell_aligns() {
+        let md = "| k |\n| - |\n| 中a |\n| bb |";
+        let out = plain(md, 80);
+        for l in &out {
+            assert_eq!(UnicodeWidthStr::width(l.as_str()), UnicodeWidthStr::width(out[0].as_str()));
+        }
+    }
+
+    #[test]
+    fn applies_column_alignment() {
+        let md = "| left | center | right |\n| :--- | :---: | ---: |\n| a | b | c |";
+        let out = plain(md, 80);
+        assert!(out[3].starts_with("│ a "), "left column: {:?}", out[3]);
+        assert!(out[3].ends_with("c │"), "right column: {:?}", out[3]);
+        assert!(out[3].find('b').unwrap() > 6, "center column: {:?}", out[3]);
     }
 }
