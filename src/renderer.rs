@@ -682,4 +682,34 @@ mod tests {
     fn heading_inside_blockquote_keeps_prefix() {
         assert_eq!(plain("> # Hi", 80), vec!["│ Hi", "│ ══"]);
     }
+
+    #[test]
+    fn renders_unordered_list() {
+        assert_eq!(plain("- a\n- b", 80), vec!["• a", "• b"]);
+    }
+
+    #[test]
+    fn renders_ordered_list_with_numbers() {
+        assert_eq!(plain("1. a\n2. b", 80), vec!["1. a", "2. b"]);
+    }
+
+    #[test]
+    fn renders_task_list() {
+        assert_eq!(plain("- [x] done\n- [ ] todo", 80), vec!["☑ done", "☐ todo"]);
+    }
+
+    #[test]
+    fn renders_blockquote_prefix() {
+        assert_eq!(plain("> quoted", 80), vec!["│ quoted"]);
+    }
+
+    #[test]
+    fn renders_horizontal_rule() {
+        assert_eq!(plain("---", 5), vec!["─────"]);
+    }
+
+    #[test]
+    fn list_continuation_is_indented() {
+        assert_eq!(plain("- one two three", 8), vec!["• one", "  two", "  three"]);
+    }
 }
