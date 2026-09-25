@@ -834,6 +834,18 @@ mod tests {
         let out = plain(md, 80);
         assert!(out[3].starts_with("│ a "), "left column: {:?}", out[3]);
         assert!(out[3].ends_with("c │"), "right column: {:?}", out[3]);
-        assert!(out[3].find('b').unwrap() > 6, "center column: {:?}", out[3]);
+        assert_eq!(out[3], "│ a    │   b    │     c │");
+    }
+
+    #[test]
+    fn cjk_table_exact_layout() {
+        let md = "| 名称 | value |\n| --- | --- |\n| 中文 | abc |";
+        assert_eq!(plain(md, 80), vec![
+            "┌──────┬───────┐",
+            "│ 名称 │ value │",
+            "├──────┼───────┤",
+            "│ 中文 │ abc   │",
+            "└──────┴───────┘",
+        ]);
     }
 }
