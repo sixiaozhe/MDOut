@@ -227,6 +227,13 @@ fn is_hr(line: &str) -> bool {
     count >= 3
 }
 
+fn trailing_looks_like_table(md: &str) -> bool {
+    match md.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(l) => l.contains('|'),
+        None => false,
+    }
+}
+
 fn trailing_block_closed(md: &str) -> bool {
     if ends_with_blank(md) {
         return true;
@@ -278,6 +285,7 @@ struct R<'a> {
     table: Option<TableState>,
     heading_level: Option<HeadingLevel>,
     link_stack: Vec<String>,
+    last_table_start: Option<usize>,
 }
 
 impl<'a> R<'a> {
@@ -298,6 +306,7 @@ impl<'a> R<'a> {
             table: None,
             heading_level: None,
             link_stack: Vec::new(),
+            last_table_start: None,
         }
     }
 
@@ -435,6 +444,7 @@ impl<'a> R<'a> {
                 self.push_style(|s| s.link = true);
             }
             Tag::Table(aligns) => {
+                self.last_table_start = self.block_starts.last().copied();
                 self.table = Some(TableState {
                     aligns,
                     rows: Vec::new(),
@@ -680,7 +690,13 @@ impl<'a> R<'a> {
     fn finish_input(&mut self, final_flush: bool, md: &str) {
         self.emit_current();
         if !final_flush && !trailing_block_closed(md) {
-            if let Some(&start) = self.block_starts.last() {
+            let mut start = self.block_starts.last().copied();
+            if let Some(table_start) = self.last_table_start {
+                if trailing_looks_like_table(md) {
+                    start = Some(start.map_or(table_start, |s| s.min(table_start)));
+                }
+            }
+            if let Some(start) = start {
                 let start = start.min(self.out.len());
                 for line in &mut self.out[start..] {
                     line.live = true;
@@ -923,8 +939,20 @@ mod tests {
     }
 
     #[test]
+    fn partial_table_row_keeps_table_live() {
+        let o = opts(false, 80);
+        let partial = "| a | b |\n| - | - |\n|";
+        assert!(
+            render(partial, &o, false).iter().any(|l| l.live),
+            "table must stay live while a row is incomplete"
+        );
+        let done = "| a | b |\n| - | - |\n| 1 | 2 |\n\n";
+        assert!(render(done, &o, false).iter().all(|l| !l.live));
+    }
+
+    #[test]
     fn chunk_boundary_invariance() {
-        let md = "# 标题\n\n这是 **中文** 段落。\n\n- a\n- b\n\n```rust\nfn main() {}\n```\n";
+        let md = "# 标题\n\n这是 **中文** 段落。\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\n- a\n- b\n\n```rust\nfn main() {}\n```\n";
         let o = opts(false, 40);
         let final_lines = render(md, &o, true);
         for (i, _) in md.char_indices() {
