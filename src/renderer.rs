@@ -307,6 +307,8 @@ struct R<'a> {
     heading_level: Option<usize>,
     link_stack: Vec<String>,
     last_table_start: Option<usize>,
+    last_html_out_end: Option<usize>,
+    last_html_live_from: Option<usize>,
 }
 
 impl<'a> R<'a> {
@@ -329,6 +331,8 @@ impl<'a> R<'a> {
             heading_level: None,
             link_stack: Vec::new(),
             last_table_start: None,
+            last_html_out_end: None,
+            last_html_live_from: None,
         }
     }
 
@@ -648,6 +652,8 @@ impl<'a> R<'a> {
             Some(s) => s,
             None => return,
         };
+        self.last_html_out_end = None;
+        self.last_html_live_from = None;
         let pieces = crate::html::parse_block(&raw, crate::table::MAX_TABLE_DEPTH);
         let has_table = pieces
             .iter()
@@ -660,11 +666,14 @@ impl<'a> R<'a> {
         let (first, cont) = self.prefixes();
         let pw = prefix_width(&first).max(prefix_width(&cont));
         let budget = self.opts.width.saturating_sub(pw).max(1);
-        let mut started = false;
+        let base = self.out.len();
         let mut lines: Vec<Line> = Vec::new();
+        let mut pending_from: Option<usize> = None;
+        let mut started = false;
         for piece in pieces {
             match piece {
                 crate::html::HtmlPiece::Raw(s) => {
+                    pending_from = Some(base + lines.len());
                     let spans = vec![Span { text: s, style: self.style }];
                     let (f, c) = if started { (&cont, &cont) } else { (&first, &cont) };
                     for row in wrap_with_prefix(&spans, f, c, self.opts.width) {
@@ -673,6 +682,7 @@ impl<'a> R<'a> {
                     started = true;
                 }
                 crate::html::HtmlPiece::Table(t) => {
+                    pending_from = None;
                     for line in crate::table::layout_table(&t, budget) {
                         let mut spans = cont.clone();
                         spans.extend(line);
@@ -683,6 +693,8 @@ impl<'a> R<'a> {
             }
         }
         self.out.extend(lines);
+        self.last_html_out_end = Some(self.out.len());
+        self.last_html_live_from = pending_from;
     }
 
     fn event(&mut self, ev: Event) {
@@ -734,18 +746,29 @@ impl<'a> R<'a> {
 
     fn finish_input(&mut self, final_flush: bool, md: &str) {
         self.emit_current();
-        if !final_flush && !trailing_block_closed(md) {
-            let mut start = self.block_starts.last().copied();
-            if let Some(table_start) = self.last_table_start {
-                if trailing_looks_like_table(md) {
-                    start = Some(start.map_or(table_start, |s| s.min(table_start)));
-                }
-            }
-            if let Some(start) = start {
+        if final_flush || trailing_block_closed(md) {
+            return;
+        }
+        let is_last_html = self.last_html_out_end == Some(self.out.len());
+        if is_last_html {
+            if let Some(start) = self.last_html_live_from {
                 let start = start.min(self.out.len());
                 for line in &mut self.out[start..] {
                     line.live = true;
                 }
+            }
+            return;
+        }
+        let mut start = self.block_starts.last().copied();
+        if let Some(table_start) = self.last_table_start {
+            if trailing_looks_like_table(md) {
+                start = Some(start.map_or(table_start, |s| s.min(table_start)));
+            }
+        }
+        if let Some(start) = start {
+            let start = start.min(self.out.len());
+            for line in &mut self.out[start..] {
+                line.live = true;
             }
         }
     }
@@ -1091,6 +1114,80 @@ mod tests {
         assert!(render("```\nline\n", &o, false).iter().all(|l| l.live));
         assert!(render("# T", &o, false).iter().all(|l| l.live));
         assert!(render("hello\n", &o, false).iter().all(|l| l.live));
+    }
+
+    #[test]
+    fn unclosed_html_table_stays_live() {
+        let o = opts(false, 80);
+        let partial = "<table><tr><td>a";
+        assert!(render(partial, &o, false).iter().any(|l| l.live));
+        let done = "<table><tr><td>a</td></tr></table>\n\n";
+        assert!(render(done, &o, false).iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn html_chunk_boundary_invariance() {
+        let md = "<table><tr><td>a</td><td><table><tr><td>x</td></tr></table></td></tr></table>\n\ntail\n";
+        let o = opts(false, 40);
+        let final_lines = render(md, &o, true);
+        for (i, _) in md.char_indices() {
+            let inc = render(&md[..i], &o, false);
+            let stable: Vec<&Line> = inc.iter().filter(|l| !l.live).collect();
+            for (k, l) in stable.iter().enumerate() {
+                assert_eq!(
+                    Some(&l.text),
+                    final_lines.get(k).map(|f| &f.text),
+                    "stable prefix diverged at chunk {i}, line {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn closed_html_table_single_newline_is_stable() {
+        let o = opts(false, 80);
+        let done = "<table><tr><td>a</td></tr></table>\n";
+        assert!(render(done, &o, false).iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn unclosed_html_table_with_newline_stays_live() {
+        let o = opts(false, 80);
+        let partial = "<table><tr><td>a\n";
+        assert!(render(partial, &o, false).iter().any(|l| l.live));
+    }
+
+    #[test]
+    fn inline_table_in_paragraph_not_prematurely_stable() {
+        let o = opts(false, 80);
+        let partial = "<em>hi</em> <table><tr><td>x</td></tr></table>\n";
+        assert!(
+            render(partial, &o, false).iter().any(|l| l.live),
+            "paragraph containing inline table marked stable: {:?}",
+            plain(partial, 80)
+        );
+    }
+
+    #[test]
+    fn html_table_then_raw_keeps_table_stable_and_raw_live() {
+        let o = opts(false, 80);
+        let lines = render("<table><tr><td>x</td></tr></table>\ntail\n", &o, false);
+        assert!(lines.iter().take(3).all(|l| !l.live), "table lines must be stable: {:?}", lines);
+        assert!(lines.last().unwrap().live, "trailing raw must be live: {:?}", lines);
+    }
+
+    #[test]
+    fn html_table_in_blockquote_then_sibling_stays_live() {
+        let o = opts(false, 80);
+        let lines = render("> <table><tr><td>x</td></tr></table>\n>\n> more\n", &o, false);
+        assert!(lines.last().unwrap().live, "sibling in blockquote must stay live: {:?}", lines);
+    }
+
+    #[test]
+    fn html_table_in_list_then_sibling_stays_live() {
+        let o = opts(false, 80);
+        let lines = render("- <table><tr><td>x</td></tr></table>\n\n- more\n", &o, false);
+        assert!(lines.last().unwrap().live, "sibling list item must stay live: {:?}", lines);
     }
 
     #[test]
