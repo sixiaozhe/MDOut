@@ -1,5 +1,10 @@
 #![allow(dead_code)]
 
+use crate::renderer::{Span, Style};
+use crate::table::{Block, Cell, Row, TableModel};
+
+const MAX_HTML_NEST: usize = 64;
+
 const VOID: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source",
     "track", "wbr",
@@ -185,6 +190,259 @@ fn decode_entity(ent: &str) -> Option<String> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum HtmlPiece {
+    Table(TableModel),
+    Raw(String),
+}
+
+#[derive(Clone, Debug)]
+enum Node {
+    Element { name: String, children: Vec<Node> },
+    Text(String),
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut stack: Vec<Node> = match self {
+            Node::Element { children, .. } => std::mem::take(children),
+            Node::Text(_) => Vec::new(),
+        };
+        while let Some(mut node) = stack.pop() {
+            if let Node::Element { children, .. } = &mut node {
+                stack.append(children);
+            }
+        }
+    }
+}
+
+fn push_child(stack: &mut [(String, Vec<Node>)], root: &mut Vec<Node>, node: Node) {
+    match stack.last_mut() {
+        Some((_, children)) => children.push(node),
+        None => root.push(node),
+    }
+}
+
+fn build_tree(tokens: &[Token]) -> Vec<Node> {
+    let mut root: Vec<Node> = Vec::new();
+    let mut stack: Vec<(String, Vec<Node>)> = Vec::new();
+    for tok in tokens {
+        match tok {
+            Token::Text { text, .. } => push_child(&mut stack, &mut root, Node::Text(text.clone())),
+            Token::Start { name, self_closing, .. } => {
+                if *self_closing {
+                    push_child(&mut stack, &mut root, Node::Element { name: name.clone(), children: Vec::new() });
+                } else {
+                    stack.push((name.clone(), Vec::new()));
+                }
+            }
+            Token::End { name, .. } => {
+                if let Some(pos) = stack.iter().rposition(|(n, _)| n == name) {
+                    while stack.len() > pos + 1 {
+                        let (n, c) = stack.pop().unwrap();
+                        push_child(&mut stack, &mut root, Node::Element { name: n, children: c });
+                    }
+                    let (n, c) = stack.pop().unwrap();
+                    push_child(&mut stack, &mut root, Node::Element { name: n, children: c });
+                }
+            }
+        }
+    }
+    while let Some((n, c)) = stack.pop() {
+        push_child(&mut stack, &mut root, Node::Element { name: n, children: c });
+    }
+    root
+}
+
+fn flush_text(cur: &mut Vec<Span>, out: &mut Vec<Block>) {
+    if !cur.is_empty() {
+        out.push(Block::Text(std::mem::take(cur)));
+    }
+}
+
+fn push_span(cur: &mut Vec<Span>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = cur.last_mut() {
+        if last.style == style {
+            last.text.push_str(text);
+            return;
+        }
+    }
+    cur.push(Span { text: text.to_string(), style });
+}
+
+fn walk_inline(nodes: &[Node], style: Style, depth: usize, max_depth: usize, nest: usize, cur: &mut Vec<Span>, out: &mut Vec<Block>) {
+    for node in nodes {
+        match node {
+            Node::Text(t) => push_span(cur, t, style),
+            Node::Element { name, children } => {
+                if nest >= MAX_HTML_NEST {
+                    collect_text(children, style, cur);
+                    continue;
+                }
+                match name.as_str() {
+                    "br" => flush_text(cur, out),
+                    "table" => {
+                        flush_text(cur, out);
+                        if depth >= max_depth {
+                            walk_inline(children, style, depth, max_depth, nest + 1, cur, out);
+                        } else {
+                            out.push(Block::Table(convert_table(children, depth + 1, max_depth)));
+                        }
+                    }
+                    "b" | "strong" => walk_inline(children, Style { bold: true, ..style }, depth, max_depth, nest + 1, cur, out),
+                    "i" | "em" => walk_inline(children, Style { italic: true, ..style }, depth, max_depth, nest + 1, cur, out),
+                    "code" => walk_inline(children, Style { code: true, ..style }, depth, max_depth, nest + 1, cur, out),
+                    "s" | "del" | "strike" => walk_inline(children, Style { strike: true, ..style }, depth, max_depth, nest + 1, cur, out),
+                    _ => walk_inline(children, style, depth, max_depth, nest + 1, cur, out),
+                }
+            }
+        }
+    }
+}
+
+fn collect_text(children: &[Node], style: Style, cur: &mut Vec<Span>) {
+    let mut stack: Vec<&Node> = children.iter().rev().collect();
+    while let Some(node) = stack.pop() {
+        match node {
+            Node::Text(t) => push_span(cur, t, style),
+            Node::Element { children, .. } => {
+                for c in children.iter().rev() {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+}
+
+fn cell_blocks(nodes: &[Node], depth: usize, max_depth: usize) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    walk_inline(nodes, Style::default(), depth, max_depth, 0, &mut cur, &mut out);
+    flush_text(&mut cur, &mut out);
+    out
+}
+
+fn convert_row(children: &[Node], in_thead: bool, cell_depth: usize, max_depth: usize) -> Row {
+    let mut cells = Vec::new();
+    let mut any_th = false;
+    for node in children {
+        if let Node::Element { name, children } = node {
+            if name == "td" || name == "th" {
+                if name == "th" {
+                    any_th = true;
+                }
+                cells.push(Cell { blocks: cell_blocks(children, cell_depth, max_depth) });
+            }
+        }
+    }
+    Row { cells, header: in_thead || any_th }
+}
+
+fn collect_rows(nodes: &[Node], in_thead: bool, cell_depth: usize, max_depth: usize, rows: &mut Vec<Row>) {
+    for node in nodes {
+        if let Node::Element { name, children } = node {
+            match name.as_str() {
+                "tr" => rows.push(convert_row(children, in_thead, cell_depth, max_depth)),
+                "thead" => collect_rows(children, true, cell_depth, max_depth, rows),
+                "tbody" | "tfoot" => collect_rows(children, false, cell_depth, max_depth, rows),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn convert_table(nodes: &[Node], depth: usize, max_depth: usize) -> TableModel {
+    let mut rows = Vec::new();
+    collect_rows(nodes, false, depth, max_depth, &mut rows);
+    TableModel { rows, aligns: Vec::new() }
+}
+
+fn text_content(segment: &str) -> String {
+    let mut out = String::new();
+    for tok in tokenize(segment) {
+        if let Token::Text { text, .. } = tok {
+            out.push_str(&text);
+        }
+    }
+    out
+}
+
+fn top_level_tables(tokens: &[Token]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for tok in tokens {
+        match tok {
+            Token::Start { name, self_closing, start: s, .. } if name == "table" && !*self_closing => {
+                if depth == 0 {
+                    start = *s;
+                }
+                depth += 1;
+            }
+            Token::End { name, end: e, .. } if name == "table" => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    spans.push((start, *e));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+pub fn parse_block(src: &str, max_depth: usize) -> Vec<HtmlPiece> {
+    let tokens = tokenize(src);
+    let spans = top_level_tables(&tokens);
+    if spans.is_empty() {
+        return vec![HtmlPiece::Raw(src.to_string())];
+    }
+    let mut pieces = Vec::new();
+    let mut prev = 0usize;
+    for (s, e) in spans {
+        if s > prev {
+            let raw = text_content(&src[prev..s]);
+            if !raw.trim().is_empty() {
+                pieces.push(HtmlPiece::Raw(raw));
+            }
+        }
+        let sub: Vec<Token> = tokens
+            .iter()
+            .filter(|t| {
+                let (ts, te) = token_bounds(t);
+                ts >= s && te <= e
+            })
+            .cloned()
+            .collect();
+        let tree = build_tree(&sub);
+        if let Some(Node::Element { name, children }) = tree.first() {
+            if name == "table" {
+                pieces.push(HtmlPiece::Table(convert_table(children, 1, max_depth)));
+            }
+        }
+        prev = e;
+    }
+    if prev < src.len() {
+        let raw = text_content(&src[prev..]);
+        if !raw.trim().is_empty() {
+            pieces.push(HtmlPiece::Raw(raw));
+        }
+    }
+    pieces
+}
+
+fn token_bounds(t: &Token) -> (usize, usize) {
+    match t {
+        Token::Start { start, end, .. } | Token::End { start, end, .. } | Token::Text { start, end, .. } => (*start, *end),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +521,138 @@ mod tests {
             tokenize("< &amp;")[0],
             Token::Text { text: "< &".to_string(), start: 0, end: 7 }
         );
+    }
+
+    fn tbl(rows: &[(&[&str], bool)]) -> TableModel {
+        TableModel {
+            rows: rows
+                .iter()
+                .map(|(cells, header)| Row {
+                    cells: cells
+                        .iter()
+                        .map(|c| Cell {
+                            blocks: vec![Block::Text(vec![Span { text: c.to_string(), style: Style::default() }])],
+                        })
+                        .collect(),
+                    header: *header,
+                })
+                .collect(),
+            aligns: vec![],
+        }
+    }
+
+    #[test]
+    fn no_table_is_passthrough_raw() {
+        assert_eq!(parse_block("<div>hi</div>", 8), vec![HtmlPiece::Raw("<div>hi</div>".to_string())]);
+    }
+
+    #[test]
+    fn parses_simple_table() {
+        let pieces = parse_block("<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>", 8);
+        assert_eq!(pieces, vec![HtmlPiece::Table(tbl(&[(&["a", "b"], true), (&["1", "2"], false)]))]);
+    }
+
+    #[test]
+    fn wrapper_tags_are_transparent_around_table() {
+        let pieces = parse_block("<div>A<table><tr><td>x</td></tr></table>B</div>", 8);
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(pieces[0], HtmlPiece::Raw("A".to_string()));
+        assert!(matches!(pieces[1], HtmlPiece::Table(_)));
+        assert_eq!(pieces[2], HtmlPiece::Raw("B".to_string()));
+    }
+
+    #[test]
+    fn nested_table_is_recursive() {
+        let src = "<table><tr><td><table><tr><td>x</td></tr></table></td></tr></table>";
+        let pieces = parse_block(src, 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => match &t.rows[0].cells[0].blocks[0] {
+                Block::Table(inner) => assert_eq!(inner.rows[0].cells[0].blocks.len(), 1),
+                other => panic!("expected inner table, got {:?}", other),
+            },
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn br_splits_text_blocks() {
+        let pieces = parse_block("<table><tr><td>a<br>b</td></tr></table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => assert_eq!(t.rows[0].cells[0].blocks.len(), 2),
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn inline_tags_become_styles() {
+        let pieces = parse_block("<table><tr><td><b>x</b><i>y</i></td></tr></table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                let spans = match &t.rows[0].cells[0].blocks[0] {
+                    Block::Text(s) => s,
+                    other => panic!("expected text, got {:?}", other),
+                };
+                assert!(spans.iter().any(|s| s.style.bold && s.text == "x"));
+                assert!(spans.iter().any(|s| s.style.italic && s.text == "y"));
+            }
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thead_marks_header_rows() {
+        let pieces = parse_block("<table><thead><tr><td>h</td></tr></thead><tbody><tr><td>b</td></tr></tbody></table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                assert!(t.rows[0].header);
+                assert!(!t.rows[1].header);
+            }
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_tables_keep_order() {
+        let src = "<table><tr><td>a</td></tr></table>mid<table><tr><td>b</td></tr></table>";
+        let pieces = parse_block(src, 8);
+        assert!(matches!(pieces[0], HtmlPiece::Table(_)));
+        assert_eq!(pieces[1], HtmlPiece::Raw("mid".to_string()));
+        assert!(matches!(pieces[2], HtmlPiece::Table(_)));
+    }
+
+    #[test]
+    fn stray_end_table_does_not_duplicate() {
+        let pieces = parse_block("<table><tr><td>a</td></tr></table></table>", 8);
+        assert_eq!(pieces.iter().filter(|p| matches!(p, HtmlPiece::Table(_))).count(), 1);
+    }
+
+    #[test]
+    fn self_closing_table_does_not_poison() {
+        let pieces = parse_block("<table/><table><tr><td>a</td></tr></table>", 8);
+        assert_eq!(pieces.iter().filter(|p| matches!(p, HtmlPiece::Table(_))).count(), 1);
+    }
+
+    #[test]
+    fn deeply_nested_html_does_not_overflow() {
+        let mut s = String::from("<table><tr><td>");
+        for _ in 0..50000 {
+            s.push_str("<div>");
+        }
+        s.push_str("deep");
+        for _ in 0..50000 {
+            s.push_str("</div>");
+        }
+        s.push_str("</td></tr></table>");
+        let pieces = parse_block(&s, 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                let text: String = match &t.rows[0].cells[0].blocks[0] {
+                    Block::Text(spans) => spans.iter().map(|sp| sp.text.as_str()).collect(),
+                    other => panic!("expected text, got {:?}", other),
+                };
+                assert!(text.contains("deep"));
+            }
+            other => panic!("expected table, got {:?}", other),
+        }
     }
 }
