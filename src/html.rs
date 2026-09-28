@@ -416,7 +416,20 @@ fn strip_script_style(tokens: Vec<Token>) -> Vec<Token> {
     out
 }
 
-fn top_level_tables(tokens: &[Token]) -> Vec<(usize, usize)> {
+pub fn has_unterminated_table(src: &str) -> bool {
+    let tokens = strip_script_style(tokenize(src));
+    let mut depth = 0usize;
+    for tok in &tokens {
+        match tok {
+            Token::Start { name, self_closing, .. } if name == "table" && !*self_closing => depth += 1,
+            Token::End { name, .. } if name == "table" => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth > 0
+}
+
+fn top_level_tables(tokens: &[Token], src_len: usize) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut depth = 0usize;
     let mut start = 0usize;
@@ -440,12 +453,15 @@ fn top_level_tables(tokens: &[Token]) -> Vec<(usize, usize)> {
             _ => {}
         }
     }
+    if depth > 0 {
+        spans.push((start, src_len));
+    }
     spans
 }
 
 pub fn parse_block(src: &str, max_depth: usize) -> Vec<HtmlPiece> {
     let tokens = strip_script_style(tokenize(src));
-    let spans = top_level_tables(&tokens);
+    let spans = top_level_tables(&tokens, src.len());
     if spans.is_empty() {
         return vec![HtmlPiece::Raw(src.to_string())];
     }
@@ -751,6 +767,22 @@ mod tests {
         let pieces = parse_block("<table><tr><td>a<td>b</td></tr></table>", 8);
         match &pieces[0] {
             HtmlPiece::Table(t) => assert_eq!(t.rows[0].cells.len(), 2, "cells must split: {:?}", t),
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unterminated_table_still_converts() {
+        let pieces = parse_block("<table><tr><td>hello", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                assert_eq!(t.rows.len(), 1);
+                let text: String = match &t.rows[0].cells[0].blocks[0] {
+                    Block::Text(spans) => spans.iter().map(|s| s.text.as_str()).collect(),
+                    other => panic!("expected text, got {:?}", other),
+                };
+                assert_eq!(text, "hello");
+            }
             other => panic!("expected table, got {:?}", other),
         }
     }

@@ -669,6 +669,7 @@ impl<'a> R<'a> {
         let base = self.out.len();
         let mut lines: Vec<Line> = Vec::new();
         let mut pending_from: Option<usize> = None;
+        let mut table_from: Option<usize> = None;
         let mut started = false;
         for piece in pieces {
             match piece {
@@ -683,6 +684,9 @@ impl<'a> R<'a> {
                 }
                 crate::html::HtmlPiece::Table(t) => {
                     pending_from = None;
+                    if table_from.is_none() {
+                        table_from = Some(base + lines.len());
+                    }
                     for line in crate::table::layout_table(&t, budget) {
                         let mut spans = cont.clone();
                         spans.extend(line);
@@ -694,7 +698,11 @@ impl<'a> R<'a> {
         }
         self.out.extend(lines);
         self.last_html_out_end = Some(self.out.len());
-        self.last_html_live_from = pending_from;
+        // If a trailing Raw exists, only that part is live-pending.
+        // Otherwise, an unterminated table block still needs its grid
+        // marked live; a closed one is already final.
+        let unterminated = crate::html::has_unterminated_table(&raw);
+        self.last_html_live_from = pending_from.or(if unterminated { table_from } else { None });
     }
 
     fn event(&mut self, ev: Event) {
@@ -1141,6 +1149,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unclosed_html_table_renders_as_live_table() {
+        let o = opts(false, 80);
+        let lines = render("<table><tr><td>hello", &o, false);
+        assert!(lines.iter().any(|l| l.text.contains('┌')), "expected grid: {:?}", lines);
+        assert!(lines.iter().all(|l| l.live), "unterminated table must be live: {:?}", lines);
     }
 
     #[test]
