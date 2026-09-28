@@ -26,6 +26,10 @@ $ llm --stream "解释一下 TCP 三次握手" | mdout
 
 ![中英文表格](docs/assets/table.gif)
 
+**HTML 嵌套子表格** —— 解析 HTML `<table>`，真网格嵌套渲染：内层表格画在外层单元格里，外层行高自动撑开，窄终端下逐层收缩换行：
+
+![HTML 嵌套子表格](docs/assets/nested-table.gif)
+
 > 上图由脚本调用真实的 `mdout` 输出渲染而成，见 `tools/make_demo_gifs.py`。
 
 ## 特性
@@ -115,6 +119,31 @@ cat doc.md | mdout --no-highlight
 | 表格 | `┌─┬─┐` 边框，`unicode-width` 计算中英文列宽，支持 `:--` `:-:` `--:` 对齐 |
 | HTML `<table>` | 解析块内 `<table>`，真网格嵌套渲染（深度上限 8，超出降级为文本）；支持 `<td>`/`<th>`/`<tr>` 与行内标签；忽略 colspan/rowspan |
 | 水平线 | `─` 铺满宽度 |
+
+### HTML 嵌套表格示例
+
+单元格里可以放表格，渲染成真正的嵌套网格（外层行高自动撑开，窄终端逐层收缩换行）：
+
+```html
+<table>
+  <tr><th>服务</th><th>区域（含内嵌表）</th><th>QPS</th></tr>
+  <tr>
+    <td><b>api-gateway</b><br><code>v2.3.1</code></td>
+    <td>
+      <table>
+        <tr><th>机房</th><th>实例</th></tr>
+        <tr><td>北京 &amp; 上海</td><td>12</td></tr>
+        <tr><td>广州</td><td>5</td></tr>
+      </table>
+    </td>
+    <td>12,500</td>
+  </tr>
+</table>
+```
+
+```bash
+cat servers.md | mdout --width 80
+```
 
 ## 工作原理
 

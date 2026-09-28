@@ -18,8 +18,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "target", "release", "mdout")
 OUT_DIR = os.path.join(ROOT, "docs", "assets")
 
-FONT_PATH = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
-FONT_INDEX = 1
+def pick_font():
+    candidates = [
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 1),
+        ("/home/sixz/.fonts/NotoSansCJKsc-Regular.otf", 0),
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 0),
+    ]
+    for path, index in candidates:
+        if os.path.exists(path):
+            return path, index
+    raise SystemExit("no usable font found; set FONT_PATH manually")
+
+
+FONT_PATH, FONT_INDEX = pick_font()
 FONT_SIZE = 20
 
 COLS = 74
@@ -287,6 +299,54 @@ def build_table_gif(path):
     save_gif(frames, durations, path)
 
 
+def build_nested_table_gif(path):
+    cmd = "cat servers.md | mdout"
+    md = (
+        "<div>\n"
+        '<table>\n'
+        "  <tr><th>服务</th><th>区域（含内嵌表）</th><th>QPS</th></tr>\n"
+        "  <tr>\n"
+        "    <td><b>api-gateway</b><br><code>v2.3.1</code></td>\n"
+        "    <td>\n"
+        "      <table>\n"
+        "        <tr><th>机房</th><th>实例</th></tr>\n"
+        "        <tr><td>北京 &amp; 上海</td><td>12</td></tr>\n"
+        "        <tr><td>广州</td><td>5</td></tr>\n"
+        "      </table>\n"
+        "    </td>\n"
+        "    <td>12,500</td>\n"
+        "  </tr>\n"
+        "  <tr>\n"
+        "    <td><b>auth-service</b></td>\n"
+        "    <td>\n"
+        "      <table>\n"
+        "        <tr><th>机房</th><th>实例</th></tr>\n"
+        "        <tr><td>北京</td><td>8</td></tr>\n"
+        "      </table>\n"
+        "    </td>\n"
+        "    <td>3,200</td>\n"
+        "  </tr>\n"
+        "</table>\n"
+        "</div>\n"
+    )
+    frames, durations = [], []
+    for k in range(1, len(cmd) + 1):
+        frames.append(render_frame([prompt_line(cmd[:k])], cursor=True))
+        durations.append(60)
+
+    total = len(md)
+    steps = 40
+    for s in range(1, steps + 1):
+        cut = max(1, round(total * s / steps))
+        body = [prompt_line(cmd)] + mdout_render(md[:cut])
+        frames.append(render_frame(body, cursor=s < steps))
+        durations.append(110)
+
+    frames.append(render_frame([prompt_line(cmd)] + mdout_render(md), cursor=False))
+    durations.append(2600)
+    save_gif(frames, durations, path)
+
+
 def save_gif(frames, durations, path):
     pal = [f.convert("P", palette=Image.ADAPTIVE, colors=64) for f in frames]
     pal[0].save(path, save_all=True, append_images=pal[1:], duration=durations,
@@ -299,6 +359,7 @@ def main():
     build_stream_gif(os.path.join(OUT_DIR, "stream.gif"))
     build_features_gif(os.path.join(OUT_DIR, "features.gif"))
     build_table_gif(os.path.join(OUT_DIR, "table.gif"))
+    build_nested_table_gif(os.path.join(OUT_DIR, "nested-table.gif"))
 
 
 if __name__ == "__main__":
