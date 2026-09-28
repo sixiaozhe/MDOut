@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use unicode_width::UnicodeWidthStr;
+
 fn run_with(input: &[u8]) -> (bool, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_mdout"))
         .stdin(Stdio::piped())
@@ -129,4 +131,25 @@ fn streaming_survives_closed_pipe() {
     let _ = child.stdin.take().unwrap().write_all(input.as_bytes());
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn html_nested_table_renders_within_width() {
+    let md = "<table><tr><td>aaaaaaaaaa</td><td><table><tr><td>x</td></tr></table></td></tr></table>\n";
+    let out = run_cmd(&["--width", "20"], &[], md.as_bytes());
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.lines().filter(|l| l.contains('┌')).count() >= 2,
+        "expected outer and inner table borders: {s:?}"
+    );
+    assert!(s.contains('x'), "expected nested cell content: {s:?}");
+    assert!(s.contains("│ aaaaaaa │"), "expected padded wrapped cell: {s:?}");
+    assert!(!s.contains("aaaaaaaaaa"), "long cell should have wrapped: {s:?}");
+    for line in s.lines() {
+        assert!(
+            UnicodeWidthStr::width(line) <= 20,
+            "line exceeded width: {line:?}"
+        );
+    }
 }

@@ -87,7 +87,7 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-fn to_chars(spans: &[Span]) -> Vec<(char, Style)> {
+pub(crate) fn to_chars(spans: &[Span]) -> Vec<(char, Style)> {
     let mut v = Vec::new();
     for sp in spans {
         for c in sp.text.chars() {
@@ -97,7 +97,7 @@ fn to_chars(spans: &[Span]) -> Vec<(char, Style)> {
     v
 }
 
-fn coalesce(chars: &[(char, Style)]) -> Vec<Span> {
+pub(crate) fn coalesce(chars: &[(char, Style)]) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     for &(c, st) in chars {
         if c == '\n' {
@@ -111,7 +111,7 @@ fn coalesce(chars: &[(char, Style)]) -> Vec<Span> {
     spans
 }
 
-fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
+pub(crate) fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
     let width = width.max(1);
     let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
     let mut cur: Vec<(char, Style)> = Vec::new();
@@ -159,59 +159,6 @@ fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>>
         rows.push(cur);
     }
     rows
-}
-
-fn fit_table_widths(natural: &[usize], available: usize) -> Vec<usize> {
-    let n = natural.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if natural.iter().sum::<usize>() <= available {
-        return natural.to_vec();
-    }
-    if available <= n {
-        return vec![1; n];
-    }
-    let fits = |cap: usize| -> bool {
-        natural.iter().map(|&w| w.min(cap)).sum::<usize>() <= available
-    };
-    let (mut lo, mut hi) = (1usize, *natural.iter().max().unwrap_or(&1));
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    let mut widths: Vec<usize> = natural.iter().map(|&w| w.min(lo)).collect();
-    let mut remaining = available - widths.iter().sum::<usize>();
-    while remaining > 0 {
-        let mut progressed = false;
-        for (w, &nat) in widths.iter_mut().zip(natural.iter()) {
-            if remaining == 0 {
-                break;
-            }
-            if *w < nat {
-                *w += 1;
-                remaining -= 1;
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    widths
-}
-
-fn wrap_cell(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let chars: Vec<(char, Style)> = text.chars().map(|c| (c, Style::default())).collect();
-    wrap_widths(&chars, width)
-        .into_iter()
-        .map(|row| row.into_iter().map(|(c, _)| c).collect())
-        .collect()
 }
 
 fn prefix_width(prefix: &[Span]) -> usize {
@@ -356,9 +303,12 @@ struct R<'a> {
     code_lang: Option<String>,
     code_buf: String,
     table: Option<TableState>,
+    html_buf: Option<String>,
     heading_level: Option<usize>,
     link_stack: Vec<String>,
     last_table_start: Option<usize>,
+    last_html_out_end: Option<usize>,
+    last_html_live_from: Option<usize>,
 }
 
 impl<'a> R<'a> {
@@ -377,9 +327,12 @@ impl<'a> R<'a> {
             code_lang: None,
             code_buf: String::new(),
             table: None,
+            html_buf: None,
             heading_level: None,
             link_stack: Vec::new(),
             last_table_start: None,
+            last_html_out_end: None,
+            last_html_live_from: None,
         }
     }
 
@@ -462,6 +415,7 @@ impl<'a> R<'a> {
                 | Tag::List(_)
                 | Tag::Item
                 | Tag::Table(_)
+                | Tag::HtmlBlock
         ) {
             self.emit_current();
         }
@@ -516,6 +470,9 @@ impl<'a> R<'a> {
                 self.link_stack.push(dest_url.to_string());
                 self.push_style(|s| s.link = true);
             }
+            Tag::HtmlBlock => {
+                self.html_buf = Some(String::new());
+            }
             Tag::Table(aligns) => {
                 self.last_table_start = self.block_starts.last().copied();
                 self.table = Some(TableState {
@@ -552,6 +509,7 @@ impl<'a> R<'a> {
                 }
             }
             TagEnd::Table => self.emit_table(),
+            TagEnd::HtmlBlock => self.emit_html_block(),
             _ => {}
         }
     }
@@ -658,82 +616,93 @@ impl<'a> R<'a> {
         if ncols == 0 {
             return;
         }
-        let mut natural = vec![0usize; ncols];
-        for row in &t.rows {
-            for (i, cell) in row.iter().enumerate() {
-                if i < ncols {
-                    natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
+        let rows: Vec<crate::table::Row> = t
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(ri, r)| crate::table::Row {
+                cells: (0..ncols)
+                    .map(|i| crate::table::Cell {
+                        blocks: vec![crate::table::Block::Text(vec![Span {
+                            text: r.get(i).cloned().unwrap_or_default(),
+                            style: Style::default(),
+                        }])],
+                    })
+                    .collect(),
+                header: ri == 0,
+            })
+            .collect();
+        let aligns = (0..ncols)
+            .map(|i| t.aligns.get(i).copied().unwrap_or(Alignment::None))
+            .collect();
+        let model = crate::table::TableModel { rows, aligns };
+
+        let (_, cont) = self.prefixes();
+        let budget = self.opts.width.saturating_sub(prefix_width(&cont)).max(1);
+        let lines = crate::table::layout_table(&model, budget);
+        for line in lines {
+            let mut spans = cont.clone();
+            spans.extend(line);
+            self.out.push(Line { text: encode_line(&spans, self.opts.color), live: false });
+        }
+    }
+
+    fn emit_html_block(&mut self) {
+        let raw = match self.html_buf.take() {
+            Some(s) => s,
+            None => return,
+        };
+        self.last_html_out_end = None;
+        self.last_html_live_from = None;
+        let pieces = crate::html::parse_block(&raw, crate::table::MAX_TABLE_DEPTH);
+        let has_table = pieces
+            .iter()
+            .any(|p| matches!(p, crate::html::HtmlPiece::Table(_)));
+        if !has_table {
+            self.push_text(&raw, self.style);
+            return;
+        }
+        self.emit_current();
+        let (first, cont) = self.prefixes();
+        let pw = prefix_width(&first).max(prefix_width(&cont));
+        let budget = self.opts.width.saturating_sub(pw).max(1);
+        let base = self.out.len();
+        let mut lines: Vec<Line> = Vec::new();
+        let mut pending_from: Option<usize> = None;
+        let mut table_from: Option<usize> = None;
+        let mut started = false;
+        for piece in pieces {
+            match piece {
+                crate::html::HtmlPiece::Raw(s) => {
+                    pending_from = Some(base + lines.len());
+                    let spans = vec![Span { text: s, style: self.style }];
+                    let (f, c) = if started { (&cont, &cont) } else { (&first, &cont) };
+                    for row in wrap_with_prefix(&spans, f, c, self.opts.width) {
+                        lines.push(Line { text: encode_line(&row, self.opts.color), live: false });
+                    }
+                    started = true;
+                }
+                crate::html::HtmlPiece::Table(t) => {
+                    pending_from = None;
+                    if table_from.is_none() {
+                        table_from = Some(base + lines.len());
+                    }
+                    for line in crate::table::layout_table(&t, budget) {
+                        let mut spans = cont.clone();
+                        spans.extend(line);
+                        lines.push(Line { text: encode_line(&spans, self.opts.color), live: false });
+                    }
+                    started = true;
                 }
             }
         }
-        let q = quote_prefix(self.quote_depth);
-        let overhead = UnicodeWidthStr::width(q.as_str()) + 1 + 3 * ncols;
-        let available = self.opts.width.saturating_sub(overhead).max(ncols);
-        let widths = fit_table_widths(&natural, available);
-
-        let wrapped: Vec<Vec<Vec<String>>> = t
-            .rows
-            .iter()
-            .map(|row| {
-                (0..ncols)
-                    .map(|i| {
-                        let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                        wrap_cell(cell, widths[i])
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let border = |l: &str, m: &str, r: &str| -> String {
-            let mut s = String::new();
-            s.push_str(&q);
-            s.push_str(l);
-            for (i, w) in widths.iter().enumerate() {
-                s.push_str(&"─".repeat(w + 2));
-                s.push_str(if i + 1 < ncols { m } else { r });
-            }
-            s
-        };
-        let aligns = &t.aligns;
-        let rowstr = |cells: &[String]| -> String {
-            let mut s = String::new();
-            s.push_str(&q);
-            s.push('│');
-            for (i, width) in widths.iter().enumerate() {
-                let empty = String::new();
-                let cell = cells.get(i).unwrap_or(&empty);
-                let w = UnicodeWidthStr::width(cell.as_str());
-                let pad = width.saturating_sub(w);
-                let (lp, rp) = match aligns.get(i) {
-                    Some(Alignment::Right) => (pad, 0),
-                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
-                    _ => (0, pad),
-                };
-                s.push(' ');
-                s.push_str(&" ".repeat(lp));
-                s.push_str(cell);
-                s.push_str(&" ".repeat(rp));
-                s.push(' ');
-                s.push('│');
-            }
-            s
-        };
-        let mut lines = vec![border("┌", "┬", "┐")];
-        for (r, row) in wrapped.iter().enumerate() {
-            let height = row.iter().map(|c| c.len()).max().unwrap_or(1);
-            for li in 0..height {
-                let cells: Vec<String> =
-                    row.iter().map(|c| c.get(li).cloned().unwrap_or_default()).collect();
-                lines.push(rowstr(&cells));
-            }
-            if r == 0 {
-                lines.push(border("├", "┼", "┤"));
-            }
-        }
-        lines.push(border("└", "┴", "┘"));
-        for l in lines {
-            self.out.push(Line { text: l, live: false });
-        }
+        self.out.extend(lines);
+        self.last_html_out_end = Some(self.out.len());
+        // If a trailing Raw exists, only that part is live-pending.
+        // Otherwise, an unterminated table block still needs its grid
+        // marked live; a closed one is already final.
+        let unterminated = crate::html::has_unterminated_table(&raw);
+        self.last_html_live_from = pending_from.or(if unterminated { table_from } else { None });
     }
 
     fn event(&mut self, ev: Event) {
@@ -771,25 +740,43 @@ impl<'a> R<'a> {
                     ctx.marker = if checked { "☑ ".to_string() } else { "☐ ".to_string() };
                 }
             }
-            Event::Html(t) | Event::InlineHtml(t) => self.push_text(&t, self.style),
+            Event::Html(t) => {
+                if let Some(buf) = self.html_buf.as_mut() {
+                    buf.push_str(&t);
+                } else {
+                    self.push_text(&t, self.style);
+                }
+            }
+            Event::InlineHtml(t) => self.push_text(&t, self.style),
             _ => {}
         }
     }
 
     fn finish_input(&mut self, final_flush: bool, md: &str) {
         self.emit_current();
-        if !final_flush && !trailing_block_closed(md) {
-            let mut start = self.block_starts.last().copied();
-            if let Some(table_start) = self.last_table_start {
-                if trailing_looks_like_table(md) {
-                    start = Some(start.map_or(table_start, |s| s.min(table_start)));
-                }
-            }
-            if let Some(start) = start {
+        if final_flush || trailing_block_closed(md) {
+            return;
+        }
+        let is_last_html = self.last_html_out_end == Some(self.out.len());
+        if is_last_html {
+            if let Some(start) = self.last_html_live_from {
                 let start = start.min(self.out.len());
                 for line in &mut self.out[start..] {
                     line.live = true;
                 }
+            }
+            return;
+        }
+        let mut start = self.block_starts.last().copied();
+        if let Some(table_start) = self.last_table_start {
+            if trailing_looks_like_table(md) {
+                start = Some(start.map_or(table_start, |s| s.min(table_start)));
+            }
+        }
+        if let Some(start) = start {
+            let start = start.min(self.out.len());
+            for line in &mut self.out[start..] {
+                line.live = true;
             }
         }
     }
@@ -981,6 +968,16 @@ mod tests {
     }
 
     #[test]
+    fn header_only_table_keeps_separator() {
+        assert_eq!(plain("| a | b |\n| - | - |", 80), vec![
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
+            "└───┴───┘",
+        ]);
+    }
+
+    #[test]
     fn aligns_cjk_and_ascii_columns() {
         let md = "| 名称 | value |\n| --- | --- |\n| 中文 | abc |";
         let out = plain(md, 80);
@@ -1128,6 +1125,88 @@ mod tests {
     }
 
     #[test]
+    fn unclosed_html_table_stays_live() {
+        let o = opts(false, 80);
+        let partial = "<table><tr><td>a";
+        assert!(render(partial, &o, false).iter().any(|l| l.live));
+        let done = "<table><tr><td>a</td></tr></table>\n\n";
+        assert!(render(done, &o, false).iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn html_chunk_boundary_invariance() {
+        let md = "<table><tr><td>a</td><td><table><tr><td>x</td></tr></table></td></tr></table>\n\ntail\n";
+        let o = opts(false, 40);
+        let final_lines = render(md, &o, true);
+        for (i, _) in md.char_indices() {
+            let inc = render(&md[..i], &o, false);
+            let stable: Vec<&Line> = inc.iter().filter(|l| !l.live).collect();
+            for (k, l) in stable.iter().enumerate() {
+                assert_eq!(
+                    Some(&l.text),
+                    final_lines.get(k).map(|f| &f.text),
+                    "stable prefix diverged at chunk {i}, line {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unclosed_html_table_renders_as_live_table() {
+        let o = opts(false, 80);
+        let lines = render("<table><tr><td>hello", &o, false);
+        assert!(lines.iter().any(|l| l.text.contains('┌')), "expected grid: {:?}", lines);
+        assert!(lines.iter().all(|l| l.live), "unterminated table must be live: {:?}", lines);
+    }
+
+    #[test]
+    fn closed_html_table_single_newline_is_stable() {
+        let o = opts(false, 80);
+        let done = "<table><tr><td>a</td></tr></table>\n";
+        assert!(render(done, &o, false).iter().all(|l| !l.live));
+    }
+
+    #[test]
+    fn unclosed_html_table_with_newline_stays_live() {
+        let o = opts(false, 80);
+        let partial = "<table><tr><td>a\n";
+        assert!(render(partial, &o, false).iter().any(|l| l.live));
+    }
+
+    #[test]
+    fn inline_table_in_paragraph_not_prematurely_stable() {
+        let o = opts(false, 80);
+        let partial = "<em>hi</em> <table><tr><td>x</td></tr></table>\n";
+        assert!(
+            render(partial, &o, false).iter().any(|l| l.live),
+            "paragraph containing inline table marked stable: {:?}",
+            plain(partial, 80)
+        );
+    }
+
+    #[test]
+    fn html_table_then_raw_keeps_table_stable_and_raw_live() {
+        let o = opts(false, 80);
+        let lines = render("<table><tr><td>x</td></tr></table>\ntail\n", &o, false);
+        assert!(lines.iter().take(3).all(|l| !l.live), "table lines must be stable: {:?}", lines);
+        assert!(lines.last().unwrap().live, "trailing raw must be live: {:?}", lines);
+    }
+
+    #[test]
+    fn html_table_in_blockquote_then_sibling_stays_live() {
+        let o = opts(false, 80);
+        let lines = render("> <table><tr><td>x</td></tr></table>\n>\n> more\n", &o, false);
+        assert!(lines.last().unwrap().live, "sibling in blockquote must stay live: {:?}", lines);
+    }
+
+    #[test]
+    fn html_table_in_list_then_sibling_stays_live() {
+        let o = opts(false, 80);
+        let lines = render("- <table><tr><td>x</td></tr></table>\n\n- more\n", &o, false);
+        assert!(lines.last().unwrap().live, "sibling list item must stay live: {:?}", lines);
+    }
+
+    #[test]
     fn ends_with_blank_semantics() {
         assert!(ends_with_blank(""));
         assert!(ends_with_blank("  "));
@@ -1137,5 +1216,39 @@ mod tests {
         assert!(!ends_with_blank("hello"));
         assert!(!ends_with_blank("hello\n"));
         assert!(!ends_with_blank("hello\n\u{a0}\n"));
+    }
+
+    #[test]
+    fn renders_html_table() {
+        let md = "<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>";
+        assert_eq!(plain(md, 80), vec![
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
+            "│ 1 │ 2 │",
+            "└───┴───┘",
+        ]);
+    }
+
+    #[test]
+    fn html_without_table_is_passthrough() {
+        assert_eq!(plain("<div>hi there</div>", 80), vec!["<div>hi there</div>"]);
+    }
+
+    #[test]
+    fn html_table_inside_blockquote_keeps_prefix() {
+        let out = plain("> <table><tr><td>x</td></tr></table>", 80);
+        assert!(out.iter().all(|l| l.starts_with("│ ")), "missing quote prefix: {:?}", out);
+        assert!(out.iter().any(|l| l.contains('┌')), "table not rendered: {:?}", out);
+        assert!(out.iter().any(|l| l.contains('x')), "cell missing: {:?}", out);
+    }
+
+    #[test]
+    fn list_marker_not_repeated_after_html_table() {
+        let out = plain("- <div>pre</div><table><tr><td>x</td></tr></table>tail", 80);
+        assert!(out[0].starts_with("• "), "first line should carry marker: {:?}", out);
+        let last = out.last().unwrap();
+        assert!(last.ends_with("tail") && last.starts_with(' '), "continuation must not repeat marker: {:?}", out);
+        assert!(!last.starts_with("• "), "marker repeated: {:?}", out);
     }
 }

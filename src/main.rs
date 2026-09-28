@@ -1,8 +1,10 @@
 mod app;
 mod cli;
+mod html;
 mod input;
 mod parser;
 mod renderer;
+mod table;
 mod terminal;
 
 use std::io::{IsTerminal, Write};
