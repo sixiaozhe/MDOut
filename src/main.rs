@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod html;
 mod input;
 mod parser;
 mod renderer;
