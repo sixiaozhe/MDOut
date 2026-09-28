@@ -3,7 +3,7 @@
 use pulldown_cmark::Alignment;
 use unicode_width::UnicodeWidthStr;
 
-use crate::renderer::{coalesce, to_chars, wrap_widths, Span};
+use crate::renderer::{coalesce, to_chars, wrap_widths, Span, Style};
 
 pub const MAX_TABLE_DEPTH: usize = 8;
 
@@ -91,6 +91,169 @@ fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum()
 }
 
+pub fn layout_table(model: &TableModel, budget: usize) -> Vec<Vec<Span>> {
+    layout_table_depth(model, budget.max(1), 0)
+}
+
+fn layout_table_depth(model: &TableModel, budget: usize, depth: usize) -> Vec<Vec<Span>> {
+    let ncols = model.ncols();
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let overhead = 1 + 3 * ncols;
+    if budget < overhead + ncols {
+        return flatten_table(model, budget);
+    }
+    let available = budget - overhead;
+
+    let mut natural = vec![0usize; ncols];
+    for r in &model.rows {
+        for (i, cell) in r.cells.iter().enumerate() {
+            if i < ncols {
+                natural[i] = natural[i].max(cell_natural_width(cell, available, depth));
+            }
+        }
+    }
+    let widths = fit_table_widths(&natural, available);
+
+    let rendered: Vec<Vec<Vec<Vec<Span>>>> = model
+        .rows
+        .iter()
+        .map(|r| {
+            (0..ncols)
+                .map(|i| {
+                    r.cells
+                        .get(i)
+                        .map(|c| render_cell(c, widths[i], depth))
+                        .unwrap_or_else(|| vec![Vec::new()])
+                })
+                .collect()
+        })
+        .collect();
+
+    let header_count = model.rows.iter().take_while(|r| r.header).count();
+    let mut lines = vec![border_line("┌", "┬", "┐", &widths)];
+    for (r, _) in model.rows.iter().enumerate() {
+        let cell_lines = &rendered[r];
+        let height = cell_lines.iter().map(|c| c.len()).max().unwrap_or(1);
+        for li in 0..height {
+            let cells: Vec<Vec<Span>> = cell_lines
+                .iter()
+                .map(|c| c.get(li).cloned().unwrap_or_default())
+                .collect();
+            lines.push(grid_row(&cells, &widths, &model.aligns));
+        }
+        if header_count > 0 && header_count < model.rows.len() && r + 1 == header_count {
+            lines.push(border_line("├", "┼", "┤", &widths));
+        }
+    }
+    lines.push(border_line("└", "┴", "┘", &widths));
+    lines
+}
+
+fn cell_natural_width(cell: &Cell, _cap: usize, _depth: usize) -> usize {
+    cell.blocks
+        .iter()
+        .map(|b| match b {
+            Block::Text(spans) => spans_width(spans),
+            Block::Table(_) => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn render_cell(cell: &Cell, width: usize, _depth: usize) -> Vec<Vec<Span>> {
+    let mut out: Vec<Vec<Span>> = Vec::new();
+    for block in &cell.blocks {
+        if let Block::Text(spans) = block {
+            out.extend(wrap_spans(spans, width));
+        }
+    }
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
+    out
+}
+
+fn border_line(l: &str, m: &str, r: &str, widths: &[usize]) -> Vec<Span> {
+    let mut s = String::new();
+    s.push_str(l);
+    for (i, w) in widths.iter().enumerate() {
+        s.push_str(&"─".repeat(w + 2));
+        s.push_str(if i + 1 < widths.len() { m } else { r });
+    }
+    vec![Span { text: s, style: Style::default() }]
+}
+
+fn grid_row(cells: &[Vec<Span>], widths: &[usize], aligns: &[Alignment]) -> Vec<Span> {
+    let mut line: Vec<Span> = Vec::new();
+    line.push(Span { text: "│".to_string(), style: Style::default() });
+    for (i, w) in widths.iter().enumerate() {
+        let empty: Vec<Span> = Vec::new();
+        let content = cells.get(i).unwrap_or(&empty);
+        let cw = spans_width(content);
+        let pad = w.saturating_sub(cw);
+        let (lp, rp) = match aligns.get(i) {
+            Some(Alignment::Right) => (pad, 0),
+            Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+            _ => (0, pad),
+        };
+        line.push(Span { text: " ".to_string(), style: Style::default() });
+        if lp > 0 {
+            line.push(Span { text: " ".repeat(lp), style: Style::default() });
+        }
+        line.extend(content.iter().cloned());
+        if rp > 0 {
+            line.push(Span { text: " ".repeat(rp), style: Style::default() });
+        }
+        line.push(Span { text: " ".to_string(), style: Style::default() });
+        line.push(Span { text: "│".to_string(), style: Style::default() });
+    }
+    line
+}
+
+fn plain_span(text: &str) -> Span {
+    Span { text: text.to_string(), style: Style::default() }
+}
+
+fn inline_of_blocks(blocks: &[Block]) -> Vec<Span> {
+    let mut out: Vec<Span> = Vec::new();
+    for b in blocks {
+        match b {
+            Block::Text(spans) => out.extend(spans.iter().cloned()),
+            Block::Table(t) => {
+                for (ri, r) in t.rows.iter().enumerate() {
+                    if ri > 0 {
+                        out.push(plain_span(" / "));
+                    }
+                    for (ci, c) in r.cells.iter().enumerate() {
+                        if ci > 0 {
+                            out.push(plain_span(" | "));
+                        }
+                        out.extend(inline_of_blocks(&c.blocks));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn flatten_table(model: &TableModel, width: usize) -> Vec<Vec<Span>> {
+    let mut out = Vec::new();
+    for r in &model.rows {
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, cell) in r.cells.iter().enumerate() {
+            if i > 0 {
+                spans.push(plain_span(" | "));
+            }
+            spans.extend(inline_of_blocks(&cell.blocks));
+        }
+        out.extend(wrap_spans(&spans, width.max(1)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +283,78 @@ mod tests {
     #[test]
     fn spans_width_counts_cjk_as_two() {
         assert_eq!(spans_width(&[sp("中a")]), 3);
+    }
+
+    fn text_cell(s: &str) -> Cell {
+        Cell { blocks: vec![Block::Text(vec![sp(s)])] }
+    }
+
+    fn row(cells: &[&str], header: bool) -> Row {
+        Row { cells: cells.iter().map(|c| text_cell(c)).collect(), header }
+    }
+
+    fn layout_strings(model: &TableModel, budget: usize) -> Vec<String> {
+        layout_table(model, budget)
+            .into_iter()
+            .map(|r| r.into_iter().map(|s| s.text).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn layout_flat_matches_gfm_shape() {
+        let model = TableModel {
+            rows: vec![row(&["a", "b"], true), row(&["1", "2"], false)],
+            aligns: vec![],
+        };
+        assert_eq!(layout_strings(&model, 80), vec![
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
+            "│ 1 │ 2 │",
+            "└───┴───┘",
+        ]);
+    }
+
+    #[test]
+    fn layout_flat_cjk_aligns() {
+        let model = TableModel {
+            rows: vec![row(&["名称", "value"], true), row(&["中文", "abc"], false)],
+            aligns: vec![],
+        };
+        assert_eq!(layout_strings(&model, 80), vec![
+            "┌──────┬───────┐",
+            "│ 名称 │ value │",
+            "├──────┼───────┤",
+            "│ 中文 │ abc   │",
+            "└──────┴───────┘",
+        ]);
+    }
+
+    use pulldown_cmark::Alignment;
+
+    #[test]
+    fn layout_applies_alignment() {
+        let model = TableModel {
+            rows: vec![row(&["left", "center", "right"], true), row(&["a", "b", "c"], false)],
+            aligns: vec![Alignment::None, Alignment::Center, Alignment::Right],
+        };
+        assert_eq!(layout_strings(&model, 80), vec![
+            "┌──────┬────────┬───────┐",
+            "│ left │ center │ right │",
+            "├──────┼────────┼───────┤",
+            "│ a    │   b    │     c │",
+            "└──────┴────────┴───────┘",
+        ]);
+    }
+
+    #[test]
+    fn too_narrow_table_degrades_to_text() {
+        let model = TableModel {
+            rows: vec![row(&["aaa", "bbb"], true), row(&["1", "2"], false)],
+            aligns: vec![],
+        };
+        let out = layout_strings(&model, 4);
+        assert!(out.iter().all(|l| !l.contains('│') && !l.contains('┌')));
+        assert!(out.iter().any(|l| l.contains("aaa")));
     }
 }
