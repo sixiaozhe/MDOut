@@ -32,7 +32,8 @@ pub struct TableModel {
 
 impl TableModel {
     pub fn ncols(&self) -> usize {
-        self.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+        let rows_max = self.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0);
+        self.aligns.len().max(rows_max)
     }
 }
 
@@ -143,7 +144,7 @@ fn layout_table_depth(model: &TableModel, budget: usize, depth: usize) -> Vec<Ve
                 .collect();
             lines.push(grid_row(&cells, &widths, &model.aligns));
         }
-        if header_count > 0 && header_count < model.rows.len() && r + 1 == header_count {
+        if header_count > 0 && r + 1 == header_count {
             lines.push(border_line("├", "┼", "┤", &widths));
         }
     }

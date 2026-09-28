@@ -161,15 +161,6 @@ pub(crate) fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(cha
     rows
 }
 
-fn wrap_cell(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let chars: Vec<(char, Style)> = text.chars().map(|c| (c, Style::default())).collect();
-    wrap_widths(&chars, width)
-        .into_iter()
-        .map(|row| row.into_iter().map(|(c, _)| c).collect())
-        .collect()
-}
-
 fn prefix_width(prefix: &[Span]) -> usize {
     prefix.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum()
 }
@@ -614,81 +605,34 @@ impl<'a> R<'a> {
         if ncols == 0 {
             return;
         }
-        let mut natural = vec![0usize; ncols];
-        for row in &t.rows {
-            for (i, cell) in row.iter().enumerate() {
-                if i < ncols {
-                    natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
-                }
-            }
-        }
-        let q = quote_prefix(self.quote_depth);
-        let overhead = UnicodeWidthStr::width(q.as_str()) + 1 + 3 * ncols;
-        let available = self.opts.width.saturating_sub(overhead).max(ncols);
-        let widths = crate::table::fit_table_widths(&natural, available);
-
-        let wrapped: Vec<Vec<Vec<String>>> = t
+        let rows: Vec<crate::table::Row> = t
             .rows
             .iter()
-            .map(|row| {
-                (0..ncols)
-                    .map(|i| {
-                        let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                        wrap_cell(cell, widths[i])
+            .enumerate()
+            .map(|(ri, r)| crate::table::Row {
+                cells: (0..ncols)
+                    .map(|i| crate::table::Cell {
+                        blocks: vec![crate::table::Block::Text(vec![Span {
+                            text: r.get(i).cloned().unwrap_or_default(),
+                            style: Style::default(),
+                        }])],
                     })
-                    .collect()
+                    .collect(),
+                header: ri == 0,
             })
             .collect();
+        let aligns = (0..ncols)
+            .map(|i| t.aligns.get(i).copied().unwrap_or(Alignment::None))
+            .collect();
+        let model = crate::table::TableModel { rows, aligns };
 
-        let border = |l: &str, m: &str, r: &str| -> String {
-            let mut s = String::new();
-            s.push_str(&q);
-            s.push_str(l);
-            for (i, w) in widths.iter().enumerate() {
-                s.push_str(&"─".repeat(w + 2));
-                s.push_str(if i + 1 < ncols { m } else { r });
-            }
-            s
-        };
-        let aligns = &t.aligns;
-        let rowstr = |cells: &[String]| -> String {
-            let mut s = String::new();
-            s.push_str(&q);
-            s.push('│');
-            for (i, width) in widths.iter().enumerate() {
-                let empty = String::new();
-                let cell = cells.get(i).unwrap_or(&empty);
-                let w = UnicodeWidthStr::width(cell.as_str());
-                let pad = width.saturating_sub(w);
-                let (lp, rp) = match aligns.get(i) {
-                    Some(Alignment::Right) => (pad, 0),
-                    Some(Alignment::Center) => (pad / 2, pad - pad / 2),
-                    _ => (0, pad),
-                };
-                s.push(' ');
-                s.push_str(&" ".repeat(lp));
-                s.push_str(cell);
-                s.push_str(&" ".repeat(rp));
-                s.push(' ');
-                s.push('│');
-            }
-            s
-        };
-        let mut lines = vec![border("┌", "┬", "┐")];
-        for (r, row) in wrapped.iter().enumerate() {
-            let height = row.iter().map(|c| c.len()).max().unwrap_or(1);
-            for li in 0..height {
-                let cells: Vec<String> =
-                    row.iter().map(|c| c.get(li).cloned().unwrap_or_default()).collect();
-                lines.push(rowstr(&cells));
-            }
-            if r == 0 {
-                lines.push(border("├", "┼", "┤"));
-            }
-        }
-        lines.push(border("└", "┴", "┘"));
-        for l in lines {
-            self.out.push(Line { text: l, live: false });
+        let (_, cont) = self.prefixes();
+        let budget = self.opts.width.saturating_sub(prefix_width(&cont)).max(1);
+        let lines = crate::table::layout_table(&model, budget);
+        for line in lines {
+            let mut spans = cont.clone();
+            spans.extend(line);
+            self.out.push(Line { text: encode_line(&spans, self.opts.color), live: false });
         }
     }
 
@@ -932,6 +876,16 @@ mod tests {
             "│ a │ b │",
             "├───┼───┤",
             "│ 1 │ 2 │",
+            "└───┴───┘",
+        ]);
+    }
+
+    #[test]
+    fn header_only_table_keeps_separator() {
+        assert_eq!(plain("| a | b |\n| - | - |", 80), vec![
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
             "└───┴───┘",
         ]);
     }
