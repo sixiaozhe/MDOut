@@ -161,50 +161,6 @@ pub(crate) fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(cha
     rows
 }
 
-fn fit_table_widths(natural: &[usize], available: usize) -> Vec<usize> {
-    let n = natural.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if natural.iter().sum::<usize>() <= available {
-        return natural.to_vec();
-    }
-    if available <= n {
-        return vec![1; n];
-    }
-    let fits = |cap: usize| -> bool {
-        natural.iter().map(|&w| w.min(cap)).sum::<usize>() <= available
-    };
-    let (mut lo, mut hi) = (1usize, *natural.iter().max().unwrap_or(&1));
-    while lo < hi {
-        let mid = (lo + hi).div_ceil(2);
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    let mut widths: Vec<usize> = natural.iter().map(|&w| w.min(lo)).collect();
-    let mut remaining = available - widths.iter().sum::<usize>();
-    while remaining > 0 {
-        let mut progressed = false;
-        for (w, &nat) in widths.iter_mut().zip(natural.iter()) {
-            if remaining == 0 {
-                break;
-            }
-            if *w < nat {
-                *w += 1;
-                remaining -= 1;
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    widths
-}
-
 fn wrap_cell(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let chars: Vec<(char, Style)> = text.chars().map(|c| (c, Style::default())).collect();
@@ -669,7 +625,7 @@ impl<'a> R<'a> {
         let q = quote_prefix(self.quote_depth);
         let overhead = UnicodeWidthStr::width(q.as_str()) + 1 + 3 * ncols;
         let available = self.opts.width.saturating_sub(overhead).max(ncols);
-        let widths = fit_table_widths(&natural, available);
+        let widths = crate::table::fit_table_widths(&natural, available);
 
         let wrapped: Vec<Vec<Vec<String>>> = t
             .rows

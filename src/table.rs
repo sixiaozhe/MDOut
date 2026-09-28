@@ -43,6 +43,50 @@ pub fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
         .collect()
 }
 
+pub(crate) fn fit_table_widths(natural: &[usize], available: usize) -> Vec<usize> {
+    let n = natural.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if natural.iter().sum::<usize>() <= available {
+        return natural.to_vec();
+    }
+    if available <= n {
+        return vec![1; n];
+    }
+    let fits = |cap: usize| -> bool {
+        natural.iter().map(|&w| w.min(cap)).sum::<usize>() <= available
+    };
+    let (mut lo, mut hi) = (1usize, *natural.iter().max().unwrap_or(&1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut widths: Vec<usize> = natural.iter().map(|&w| w.min(lo)).collect();
+    let mut remaining = available - widths.iter().sum::<usize>();
+    while remaining > 0 {
+        let mut progressed = false;
+        for (w, &nat) in widths.iter_mut().zip(natural.iter()) {
+            if remaining == 0 {
+                break;
+            }
+            if *w < nat {
+                *w += 1;
+                remaining -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    widths
+}
+
 fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum()
 }
