@@ -221,6 +221,28 @@ fn push_child(stack: &mut [(String, Vec<Node>)], root: &mut Vec<Node>, node: Nod
     }
 }
 
+fn autoclose_for(name: &str) -> &'static [&'static str] {
+    match name {
+        "tr" => &["tr", "td", "th"],
+        "td" | "th" => &["td", "th"],
+        "tbody" | "thead" | "tfoot" => &["td", "th", "tr", "tbody", "thead", "tfoot"],
+        _ => &[],
+    }
+}
+
+fn close_until(stack: &mut Vec<(String, Vec<Node>)>, root: &mut Vec<Node>, targets: &[&str]) {
+    let floor = stack.iter().rposition(|(n, _)| n == "table").map_or(0, |i| i + 1);
+    if let Some(pos) = stack[floor..].iter().rposition(|(n, _)| targets.contains(&n.as_str())) {
+        let pos = floor + pos;
+        while stack.len() > pos + 1 {
+            let (n, c) = stack.pop().unwrap();
+            push_child(stack, root, Node::Element { name: n, children: c });
+        }
+        let (n, c) = stack.pop().unwrap();
+        push_child(stack, root, Node::Element { name: n, children: c });
+    }
+}
+
 fn build_tree(tokens: &[Token]) -> Vec<Node> {
     let mut root: Vec<Node> = Vec::new();
     let mut stack: Vec<(String, Vec<Node>)> = Vec::new();
@@ -231,6 +253,7 @@ fn build_tree(tokens: &[Token]) -> Vec<Node> {
                 if *self_closing {
                     push_child(&mut stack, &mut root, Node::Element { name: name.clone(), children: Vec::new() });
                 } else {
+                    close_until(&mut stack, &mut root, autoclose_for(name));
                     stack.push((name.clone(), Vec::new()));
                 }
             }
@@ -294,6 +317,7 @@ fn walk_inline(nodes: &[Node], style: Style, depth: usize, max_depth: usize, nes
                     "i" | "em" => walk_inline(children, Style { italic: true, ..style }, depth, max_depth, nest + 1, cur, out),
                     "code" => walk_inline(children, Style { code: true, ..style }, depth, max_depth, nest + 1, cur, out),
                     "s" | "del" | "strike" => walk_inline(children, Style { strike: true, ..style }, depth, max_depth, nest + 1, cur, out),
+                    "script" | "style" => {}
                     _ => walk_inline(children, style, depth, max_depth, nest + 1, cur, out),
                 }
             }
@@ -360,9 +384,13 @@ fn convert_table(nodes: &[Node], depth: usize, max_depth: usize) -> TableModel {
 
 fn text_content(segment: &str) -> String {
     let mut out = String::new();
+    let mut skip = 0usize;
     for tok in tokenize(segment) {
-        if let Token::Text { text, .. } = tok {
-            out.push_str(&text);
+        match tok {
+            Token::Start { name, .. } if name == "script" || name == "style" => skip += 1,
+            Token::End { name, .. } if name == "script" || name == "style" => skip = skip.saturating_sub(1),
+            Token::Text { text, .. } if skip == 0 => out.push_str(&text),
+            _ => {}
         }
     }
     out
@@ -665,5 +693,45 @@ mod tests {
             parse_block("<table></table>", 8),
             vec![HtmlPiece::Raw("<table></table>".to_string())]
         );
+    }
+
+    #[test]
+    fn script_and_style_content_is_dropped() {
+        let pieces = parse_block("<table><tr><td><script>alert(1)</script>hi</td></tr></table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                let text: String = match &t.rows[0].cells[0].blocks[0] {
+                    Block::Text(spans) => spans.iter().map(|s| s.text.as_str()).collect(),
+                    other => panic!("expected text, got {:?}", other),
+                };
+                assert_eq!(text, "hi");
+            }
+            other => panic!("expected table, got {:?}", other),
+        }
+        assert_eq!(
+            parse_block("<table></table><style>x{}</style>", 8),
+            vec![HtmlPiece::Raw("<table></table>".to_string())]
+        );
+    }
+
+    #[test]
+    fn optional_end_tags_are_implicitly_closed() {
+        let pieces = parse_block("<table><tr><td>a</td><tr><td>b</td></table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                assert_eq!(t.rows.len(), 2, "both rows must survive: {:?}", t);
+                assert_eq!(t.rows[1].cells.len(), 1);
+            }
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn missing_td_close_still_splits_cells() {
+        let pieces = parse_block("<table><tr><td>a<td>b</td></tr></table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => assert_eq!(t.rows[0].cells.len(), 2, "cells must split: {:?}", t),
+            other => panic!("expected table, got {:?}", other),
+        }
     }
 }
