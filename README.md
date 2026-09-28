@@ -134,8 +134,3 @@ cargo clippy --all-targets -- -D warnings
 ```
 
 模块划分：`cli`（参数）、`input`（增量 UTF-8 读取）、`parser`（cmark 配置）、`renderer`（纯函数渲染）、`terminal`（宽度/提交/重绘）、`app`（去抖事件循环）、`main`（装配）。
-
-设计文档与实现计划见：
-
-- `docs/superpowers/specs/2026-09-25-md-stream-renderer-design.md`
-- `docs/superpowers/plans/2026-09-25-mdout-implementation.md`
