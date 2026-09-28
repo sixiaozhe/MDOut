@@ -87,7 +87,7 @@ fn char_width(c: char) -> usize {
     UnicodeWidthChar::width(c).unwrap_or(0)
 }
 
-fn to_chars(spans: &[Span]) -> Vec<(char, Style)> {
+pub(crate) fn to_chars(spans: &[Span]) -> Vec<(char, Style)> {
     let mut v = Vec::new();
     for sp in spans {
         for c in sp.text.chars() {
@@ -97,7 +97,7 @@ fn to_chars(spans: &[Span]) -> Vec<(char, Style)> {
     v
 }
 
-fn coalesce(chars: &[(char, Style)]) -> Vec<Span> {
+pub(crate) fn coalesce(chars: &[(char, Style)]) -> Vec<Span> {
     let mut spans: Vec<Span> = Vec::new();
     for &(c, st) in chars {
         if c == '\n' {
@@ -111,7 +111,7 @@ fn coalesce(chars: &[(char, Style)]) -> Vec<Span> {
     spans
 }
 
-fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
+pub(crate) fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
     let width = width.max(1);
     let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
     let mut cur: Vec<(char, Style)> = Vec::new();

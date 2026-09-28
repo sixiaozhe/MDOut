@@ -3,6 +3,7 @@ mod cli;
 mod input;
 mod parser;
 mod renderer;
+mod table;
 mod terminal;
 
 use std::io::{IsTerminal, Write};
