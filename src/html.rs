@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use crate::renderer::{Span, Style};
 use crate::table::{Block, Cell, Row, TableModel};
 
@@ -423,7 +421,12 @@ pub fn parse_block(src: &str, max_depth: usize) -> Vec<HtmlPiece> {
         let tree = build_tree(&sub);
         if let Some(Node::Element { name, children }) = tree.first() {
             if name == "table" {
-                pieces.push(HtmlPiece::Table(convert_table(children, 1, max_depth)));
+                let model = convert_table(children, 1, max_depth);
+                if model.ncols() == 0 {
+                    pieces.push(HtmlPiece::Raw(src[s..e].to_string()));
+                } else {
+                    pieces.push(HtmlPiece::Table(model));
+                }
             }
         }
         prev = e;
@@ -654,5 +657,13 @@ mod tests {
             }
             other => panic!("expected table, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn empty_table_falls_back_to_raw() {
+        assert_eq!(
+            parse_block("<table></table>", 8),
+            vec![HtmlPiece::Raw("<table></table>".to_string())]
+        );
     }
 }

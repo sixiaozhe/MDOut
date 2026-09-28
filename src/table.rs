@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use pulldown_cmark::Alignment;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 

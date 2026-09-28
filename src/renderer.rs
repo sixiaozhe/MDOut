@@ -303,6 +303,7 @@ struct R<'a> {
     code_lang: Option<String>,
     code_buf: String,
     table: Option<TableState>,
+    html_buf: Option<String>,
     heading_level: Option<usize>,
     link_stack: Vec<String>,
     last_table_start: Option<usize>,
@@ -324,6 +325,7 @@ impl<'a> R<'a> {
             code_lang: None,
             code_buf: String::new(),
             table: None,
+            html_buf: None,
             heading_level: None,
             link_stack: Vec::new(),
             last_table_start: None,
@@ -409,6 +411,7 @@ impl<'a> R<'a> {
                 | Tag::List(_)
                 | Tag::Item
                 | Tag::Table(_)
+                | Tag::HtmlBlock
         ) {
             self.emit_current();
         }
@@ -463,6 +466,9 @@ impl<'a> R<'a> {
                 self.link_stack.push(dest_url.to_string());
                 self.push_style(|s| s.link = true);
             }
+            Tag::HtmlBlock => {
+                self.html_buf = Some(String::new());
+            }
             Tag::Table(aligns) => {
                 self.last_table_start = self.block_starts.last().copied();
                 self.table = Some(TableState {
@@ -499,6 +505,7 @@ impl<'a> R<'a> {
                 }
             }
             TagEnd::Table => self.emit_table(),
+            TagEnd::HtmlBlock => self.emit_html_block(),
             _ => {}
         }
     }
@@ -636,6 +643,48 @@ impl<'a> R<'a> {
         }
     }
 
+    fn emit_html_block(&mut self) {
+        let raw = match self.html_buf.take() {
+            Some(s) => s,
+            None => return,
+        };
+        let pieces = crate::html::parse_block(&raw, crate::table::MAX_TABLE_DEPTH);
+        let has_table = pieces
+            .iter()
+            .any(|p| matches!(p, crate::html::HtmlPiece::Table(_)));
+        if !has_table {
+            self.push_text(&raw, self.style);
+            return;
+        }
+        self.emit_current();
+        let (first, cont) = self.prefixes();
+        let pw = prefix_width(&first).max(prefix_width(&cont));
+        let budget = self.opts.width.saturating_sub(pw).max(1);
+        let mut started = false;
+        let mut lines: Vec<Line> = Vec::new();
+        for piece in pieces {
+            match piece {
+                crate::html::HtmlPiece::Raw(s) => {
+                    let spans = vec![Span { text: s, style: self.style }];
+                    let (f, c) = if started { (&cont, &cont) } else { (&first, &cont) };
+                    for row in wrap_with_prefix(&spans, f, c, self.opts.width) {
+                        lines.push(Line { text: encode_line(&row, self.opts.color), live: false });
+                    }
+                    started = true;
+                }
+                crate::html::HtmlPiece::Table(t) => {
+                    for line in crate::table::layout_table(&t, budget) {
+                        let mut spans = cont.clone();
+                        spans.extend(line);
+                        lines.push(Line { text: encode_line(&spans, self.opts.color), live: false });
+                    }
+                    started = true;
+                }
+            }
+        }
+        self.out.extend(lines);
+    }
+
     fn event(&mut self, ev: Event) {
         if self.table.is_some() {
             self.table_event(ev);
@@ -671,7 +720,14 @@ impl<'a> R<'a> {
                     ctx.marker = if checked { "☑ ".to_string() } else { "☐ ".to_string() };
                 }
             }
-            Event::Html(t) | Event::InlineHtml(t) => self.push_text(&t, self.style),
+            Event::Html(t) => {
+                if let Some(buf) = self.html_buf.as_mut() {
+                    buf.push_str(&t);
+                } else {
+                    self.push_text(&t, self.style);
+                }
+            }
+            Event::InlineHtml(t) => self.push_text(&t, self.style),
             _ => {}
         }
     }
@@ -1047,5 +1103,39 @@ mod tests {
         assert!(!ends_with_blank("hello"));
         assert!(!ends_with_blank("hello\n"));
         assert!(!ends_with_blank("hello\n\u{a0}\n"));
+    }
+
+    #[test]
+    fn renders_html_table() {
+        let md = "<table><tr><th>a</th><th>b</th></tr><tr><td>1</td><td>2</td></tr></table>";
+        assert_eq!(plain(md, 80), vec![
+            "┌───┬───┐",
+            "│ a │ b │",
+            "├───┼───┤",
+            "│ 1 │ 2 │",
+            "└───┴───┘",
+        ]);
+    }
+
+    #[test]
+    fn html_without_table_is_passthrough() {
+        assert_eq!(plain("<div>hi there</div>", 80), vec!["<div>hi there</div>"]);
+    }
+
+    #[test]
+    fn html_table_inside_blockquote_keeps_prefix() {
+        let out = plain("> <table><tr><td>x</td></tr></table>", 80);
+        assert!(out.iter().all(|l| l.starts_with("│ ")), "missing quote prefix: {:?}", out);
+        assert!(out.iter().any(|l| l.contains('┌')), "table not rendered: {:?}", out);
+        assert!(out.iter().any(|l| l.contains('x')), "cell missing: {:?}", out);
+    }
+
+    #[test]
+    fn list_marker_not_repeated_after_html_table() {
+        let out = plain("- <div>pre</div><table><tr><td>x</td></tr></table>tail", 80);
+        assert!(out[0].starts_with("• "), "first line should carry marker: {:?}", out);
+        let last = out.last().unwrap();
+        assert!(last.ends_with("tail") && last.starts_with(' '), "continuation must not repeat marker: {:?}", out);
+        assert!(!last.starts_with("• "), "marker repeated: {:?}", out);
     }
 }
