@@ -1,7 +1,7 @@
-#![expect(dead_code)]
+#![allow(dead_code)]
 
 use pulldown_cmark::Alignment;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::renderer::{coalesce, to_chars, wrap_widths, Span, Style};
 
@@ -102,7 +102,7 @@ fn layout_table_depth(model: &TableModel, budget: usize, depth: usize) -> Vec<Ve
         return Vec::new();
     }
     let overhead = 1 + 3 * ncols;
-    if budget < overhead + ncols {
+    if budget < overhead + 2 * ncols {
         return flatten_table(model, budget);
     }
     let available = budget - overhead;
@@ -152,22 +152,78 @@ fn layout_table_depth(model: &TableModel, budget: usize, depth: usize) -> Vec<Ve
     lines
 }
 
-fn cell_natural_width(cell: &Cell, _cap: usize, _depth: usize) -> usize {
+fn block_natural_width(block: &Block, cap: usize, depth: usize) -> usize {
+    match block {
+        Block::Text(spans) => spans_width(spans).min(cap),
+        Block::Table(t) => {
+            if depth + 1 >= MAX_TABLE_DEPTH {
+                flattened_natural_width(block, cap)
+            } else {
+                table_natural_width(t, cap, depth + 1)
+            }
+        }
+    }
+}
+
+fn flattened_natural_width(block: &Block, cap: usize) -> usize {
+    let inline = inline_of_blocks(std::slice::from_ref(block));
+    let mut best = 0usize;
+    let mut cur = 0usize;
+    for sp in &inline {
+        for c in sp.text.chars() {
+            if c.is_whitespace() {
+                best = best.max(cur);
+                cur = 0;
+            } else {
+                cur += UnicodeWidthChar::width(c).unwrap_or(0);
+            }
+        }
+    }
+    best.max(cur).min(cap)
+}
+
+fn cell_natural_width(cell: &Cell, cap: usize, depth: usize) -> usize {
     cell.blocks
         .iter()
-        .map(|b| match b {
-            Block::Text(spans) => spans_width(spans),
-            Block::Table(_) => 0,
-        })
+        .map(|b| block_natural_width(b, cap, depth))
         .max()
         .unwrap_or(0)
 }
 
-fn render_cell(cell: &Cell, width: usize, _depth: usize) -> Vec<Vec<Span>> {
+fn table_natural_width(model: &TableModel, cap: usize, depth: usize) -> usize {
+    let ncols = model.ncols();
+    if ncols == 0 {
+        return 0;
+    }
+    let overhead = 1 + 3 * ncols;
+    let avail = cap.saturating_sub(overhead);
+    if avail < 2 * ncols {
+        return cap;
+    }
+    let mut cols = vec![0usize; ncols];
+    for r in &model.rows {
+        for (i, cell) in r.cells.iter().enumerate() {
+            if i < ncols {
+                cols[i] = cols[i].max(cell_natural_width(cell, avail, depth));
+            }
+        }
+    }
+    (overhead + cols.iter().map(|&c| c.max(2)).sum::<usize>()).min(cap)
+}
+
+fn render_cell(cell: &Cell, width: usize, depth: usize) -> Vec<Vec<Span>> {
     let mut out: Vec<Vec<Span>> = Vec::new();
     for block in &cell.blocks {
-        if let Block::Text(spans) = block {
-            out.extend(wrap_spans(spans, width));
+        match block {
+            Block::Text(spans) => out.extend(wrap_spans(spans, width)),
+            Block::Table(inner) => {
+                let lines = if depth + 1 >= MAX_TABLE_DEPTH {
+                    flatten_table(inner, width)
+                } else {
+                    layout_table_depth(inner, width, depth + 1)
+                };
+                out.extend(lines);
+            }
         }
     }
     if out.is_empty() {
@@ -259,9 +315,14 @@ fn flatten_table(model: &TableModel, width: usize) -> Vec<Vec<Span>> {
 mod tests {
     use super::*;
     use crate::renderer::Style;
+    use crate::renderer::Style as St;
 
     fn sp(text: &str) -> Span {
         Span { text: text.to_string(), style: Style::default() }
+    }
+
+    fn styled(text: &str, style: Style) -> Span {
+        Span { text: text.to_string(), style }
     }
 
     fn strings(rows: Vec<Vec<Span>>) -> Vec<String> {
@@ -357,5 +418,77 @@ mod tests {
         let out = layout_strings(&model, 4);
         assert!(out.iter().all(|l| !l.contains('│') && !l.contains('┌')));
         assert!(out.iter().any(|l| l.contains("aaa")));
+    }
+
+    fn inner_table() -> TableModel {
+        TableModel {
+            rows: vec![row(&["x", "y"], true), row(&["1", "2"], false)],
+            aligns: vec![],
+        }
+    }
+
+    fn outer_with_inner() -> TableModel {
+        let inner = Block::Table(inner_table());
+        TableModel {
+            rows: vec![
+                Row { cells: vec![text_cell("head"), Cell { blocks: vec![inner.clone()] }], header: true },
+                Row { cells: vec![text_cell("a"), text_cell("b")], header: false },
+            ],
+            aligns: vec![],
+        }
+    }
+
+    #[test]
+    fn nested_table_is_embedded_in_cell() {
+        let out = layout_strings(&outer_with_inner(), 80);
+        let widths: Vec<usize> = out.iter().map(|l| UnicodeWidthStr::width(l.as_str())).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged nested table: {:?}", out);
+        assert!(out.iter().filter(|l| l.contains('┌')).count() >= 2, "inner border missing: {:?}", out);
+        assert!(out.iter().filter(|l| l.contains('└')).count() >= 2, "inner border missing: {:?}", out);
+        assert!(out.len() > 5, "outer height must expand: {:?}", out);
+    }
+
+    #[test]
+    fn nested_table_degrades_past_depth_limit() {
+        let mut model = inner_table();
+        for _ in 0..(MAX_TABLE_DEPTH + 2) {
+            let inner = Block::Table(model);
+            model = TableModel {
+                rows: vec![Row { cells: vec![Cell { blocks: vec![inner] }], header: false }],
+                aligns: vec![],
+            };
+        }
+        let out = layout_strings(&model, 80);
+        assert!(!out.is_empty());
+        assert!(out.iter().all(|l| UnicodeWidthStr::width(l.as_str()) <= 80));
+        assert!(out.iter().any(|l| l.contains('x')), "degraded content lost: {:?}", out);
+        assert!(
+            out.iter().filter(|l| l.contains('┌')).count() <= MAX_TABLE_DEPTH,
+            "nesting not degraded: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn nested_table_shrinks_to_narrow_budget() {
+        let out = layout_strings(&outer_with_inner(), 12);
+        let widths: Vec<usize> = out.iter().map(|l| UnicodeWidthStr::width(l.as_str())).collect();
+        assert!(widths.iter().all(|w| *w <= 12), "overflow at narrow budget: {:?}", out);
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged at narrow budget: {:?}", out);
+    }
+
+    #[test]
+    fn nested_layout_preserves_inline_style() {
+        let outer = TableModel {
+            rows: vec![Row {
+                cells: vec![Cell {
+                    blocks: vec![Block::Text(vec![styled("bold", St { bold: true, ..St::default() })])],
+                }],
+                header: false,
+            }],
+            aligns: vec![],
+        };
+        let lines = layout_table(&outer, 40);
+        assert!(lines.iter().flatten().any(|s| s.style.bold && s.text.contains("bold")));
     }
 }
