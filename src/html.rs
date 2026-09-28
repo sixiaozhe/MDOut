@@ -223,9 +223,9 @@ fn push_child(stack: &mut [(String, Vec<Node>)], root: &mut Vec<Node>, node: Nod
 
 fn autoclose_for(name: &str) -> &'static [&'static str] {
     match name {
-        "tr" => &["tr", "td", "th"],
+        "tr" => &["tr"],
         "td" | "th" => &["td", "th"],
-        "tbody" | "thead" | "tfoot" => &["td", "th", "tr", "tbody", "thead", "tfoot"],
+        "tbody" | "thead" | "tfoot" => &["tbody", "thead", "tfoot"],
         _ => &[],
     }
 }
@@ -396,6 +396,26 @@ fn text_content(segment: &str) -> String {
     out
 }
 
+fn strip_script_style(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut skip = 0usize;
+    for tok in tokens {
+        match &tok {
+            Token::Start { name, self_closing, .. } if name == "script" || name == "style" => {
+                if !*self_closing {
+                    skip += 1;
+                }
+            }
+            Token::End { name, .. } if name == "script" || name == "style" => {
+                skip = skip.saturating_sub(1);
+            }
+            _ if skip == 0 => out.push(tok),
+            _ => {}
+        }
+    }
+    out
+}
+
 fn top_level_tables(tokens: &[Token]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut depth = 0usize;
@@ -424,7 +444,7 @@ fn top_level_tables(tokens: &[Token]) -> Vec<(usize, usize)> {
 }
 
 pub fn parse_block(src: &str, max_depth: usize) -> Vec<HtmlPiece> {
-    let tokens = tokenize(src);
+    let tokens = strip_script_style(tokenize(src));
     let spans = top_level_tables(&tokens);
     if spans.is_empty() {
         return vec![HtmlPiece::Raw(src.to_string())];
@@ -731,6 +751,43 @@ mod tests {
         let pieces = parse_block("<table><tr><td>a<td>b</td></tr></table>", 8);
         match &pieces[0] {
             HtmlPiece::Table(t) => assert_eq!(t.rows[0].cells.len(), 2, "cells must split: {:?}", t),
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn script_containing_table_is_not_rendered() {
+        let pieces = parse_block("<script>var s=\"<table><tr><td>x</td></tr></table>\";</script>", 8);
+        assert!(
+            pieces.iter().all(|p| matches!(p, HtmlPiece::Raw(_))),
+            "table inside script must not render: {:?}",
+            pieces
+        );
+    }
+
+    #[test]
+    fn omitted_close_then_new_row_keeps_rows() {
+        let pieces = parse_block("<table><tr><td>a<td>b<tr><td>c<td>d</table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                assert_eq!(t.rows.len(), 2, "both rows must survive: {:?}", t);
+                assert_eq!(t.rows[0].cells.len(), 2);
+                assert_eq!(t.rows[1].cells.len(), 2);
+            }
+            other => panic!("expected table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn omitted_cell_close_before_tbody_keeps_header() {
+        let pieces = parse_block("<table><thead><tr><th>h1<th>h2<tbody><tr><td>a<td>b</table>", 8);
+        match &pieces[0] {
+            HtmlPiece::Table(t) => {
+                assert!(t.rows[0].header, "first row must be header: {:?}", t);
+                assert!(!t.rows[1].header, "body row must not be header: {:?}", t);
+                assert_eq!(t.rows[0].cells.len(), 2);
+                assert_eq!(t.rows[1].cells.len(), 2);
+            }
             other => panic!("expected table, got {:?}", other),
         }
     }
