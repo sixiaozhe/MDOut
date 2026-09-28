@@ -161,6 +161,59 @@ fn wrap_widths(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>>
     rows
 }
 
+fn fit_table_widths(natural: &[usize], available: usize) -> Vec<usize> {
+    let n = natural.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    if natural.iter().sum::<usize>() <= available {
+        return natural.to_vec();
+    }
+    if available <= n {
+        return vec![1; n];
+    }
+    let fits = |cap: usize| -> bool {
+        natural.iter().map(|&w| w.min(cap)).sum::<usize>() <= available
+    };
+    let (mut lo, mut hi) = (1usize, *natural.iter().max().unwrap_or(&1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let mut widths: Vec<usize> = natural.iter().map(|&w| w.min(lo)).collect();
+    let mut remaining = available - widths.iter().sum::<usize>();
+    while remaining > 0 {
+        let mut progressed = false;
+        for (w, &nat) in widths.iter_mut().zip(natural.iter()) {
+            if remaining == 0 {
+                break;
+            }
+            if *w < nat {
+                *w += 1;
+                remaining -= 1;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    widths
+}
+
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let chars: Vec<(char, Style)> = text.chars().map(|c| (c, Style::default())).collect();
+    wrap_widths(&chars, width)
+        .into_iter()
+        .map(|row| row.into_iter().map(|(c, _)| c).collect())
+        .collect()
+}
+
 fn prefix_width(prefix: &[Span]) -> usize {
     prefix.iter().map(|s| UnicodeWidthStr::width(s.text.as_str())).sum()
 }
@@ -190,6 +243,26 @@ fn heading_num(level: HeadingLevel) -> usize {
         HeadingLevel::H4 => 4,
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
+    }
+}
+
+fn heading_underline(level: usize) -> Option<char> {
+    match level {
+        1 => Some('═'),
+        2 => Some('─'),
+        3 => Some('┄'),
+        4 => Some('┅'),
+        5 => Some('┈'),
+        6 => Some('┉'),
+        _ => None,
+    }
+}
+
+fn heading_prefix(level: usize) -> Option<String> {
+    if level >= 7 {
+        Some(format!("{} ", "#".repeat(level)))
+    } else {
+        None
     }
 }
 
@@ -283,7 +356,7 @@ struct R<'a> {
     code_lang: Option<String>,
     code_buf: String,
     table: Option<TableState>,
-    heading_level: Option<HeadingLevel>,
+    heading_level: Option<usize>,
     link_stack: Vec<String>,
     last_table_start: Option<usize>,
 }
@@ -401,10 +474,10 @@ impl<'a> R<'a> {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => {
                 self.push_style(|s| s.bold = true);
-                self.heading_level = Some(level);
                 let n = heading_num(level);
-                if n >= 3 {
-                    self.cur.push(Span { text: format!("{} ", "#".repeat(n)), style: self.style });
+                self.heading_level = Some(n);
+                if let Some(pfx) = heading_prefix(n) {
+                    self.cur.push(Span { text: pfx, style: self.style });
                 }
             }
             Tag::BlockQuote(..) => self.quote_depth += 1,
@@ -499,12 +572,7 @@ impl<'a> R<'a> {
                 });
             }
             if let Some(level) = self.heading_level.take() {
-                let ch = match level {
-                    HeadingLevel::H1 => Some('═'),
-                    HeadingLevel::H2 => Some('─'),
-                    _ => None,
-                };
-                if let Some(ch) = ch {
+                if let Some(ch) = heading_underline(level) {
                     let mut spans = cont.clone();
                     spans.push(Span {
                         text: ch.to_string().repeat(w),
@@ -590,15 +658,32 @@ impl<'a> R<'a> {
         if ncols == 0 {
             return;
         }
-        let mut widths = vec![0usize; ncols];
+        let mut natural = vec![0usize; ncols];
         for row in &t.rows {
             for (i, cell) in row.iter().enumerate() {
                 if i < ncols {
-                    widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
+                    natural[i] = natural[i].max(UnicodeWidthStr::width(cell.as_str()));
                 }
             }
         }
         let q = quote_prefix(self.quote_depth);
+        let overhead = UnicodeWidthStr::width(q.as_str()) + 1 + 3 * ncols;
+        let available = self.opts.width.saturating_sub(overhead).max(ncols);
+        let widths = fit_table_widths(&natural, available);
+
+        let wrapped: Vec<Vec<Vec<String>>> = t
+            .rows
+            .iter()
+            .map(|row| {
+                (0..ncols)
+                    .map(|i| {
+                        let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+                        wrap_cell(cell, widths[i])
+                    })
+                    .collect()
+            })
+            .collect();
+
         let border = |l: &str, m: &str, r: &str| -> String {
             let mut s = String::new();
             s.push_str(&q);
@@ -610,13 +695,13 @@ impl<'a> R<'a> {
             s
         };
         let aligns = &t.aligns;
-        let rowstr = |row: &[String]| -> String {
+        let rowstr = |cells: &[String]| -> String {
             let mut s = String::new();
             s.push_str(&q);
             s.push('│');
             for (i, width) in widths.iter().enumerate() {
                 let empty = String::new();
-                let cell = row.get(i).unwrap_or(&empty);
+                let cell = cells.get(i).unwrap_or(&empty);
                 let w = UnicodeWidthStr::width(cell.as_str());
                 let pad = width.saturating_sub(w);
                 let (lp, rp) = match aligns.get(i) {
@@ -634,12 +719,16 @@ impl<'a> R<'a> {
             s
         };
         let mut lines = vec![border("┌", "┬", "┐")];
-        if let Some(h) = t.rows.first() {
-            lines.push(rowstr(h));
-            lines.push(border("├", "┼", "┤"));
-        }
-        for row in t.rows.iter().skip(1) {
-            lines.push(rowstr(row));
+        for (r, row) in wrapped.iter().enumerate() {
+            let height = row.iter().map(|c| c.len()).max().unwrap_or(1);
+            for li in 0..height {
+                let cells: Vec<String> =
+                    row.iter().map(|c| c.get(li).cloned().unwrap_or_default()).collect();
+                lines.push(rowstr(&cells));
+            }
+            if r == 0 {
+                lines.push(border("├", "┼", "┤"));
+            }
         }
         lines.push(border("└", "┴", "┘"));
         for l in lines {
@@ -741,7 +830,23 @@ mod tests {
     fn renders_heading_with_underline() {
         assert_eq!(plain("# Title", 80), vec!["Title", "═════"]);
         assert_eq!(plain("## Sub", 80), vec!["Sub", "───"]);
-        assert_eq!(plain("### Deep", 80), vec!["### Deep"]);
+        assert_eq!(plain("### Deep", 80), vec!["Deep", "┄┄┄┄"]);
+        assert_eq!(plain("#### D4", 80), vec!["D4", "┅┅"]);
+        assert_eq!(plain("##### D5", 80), vec!["D5", "┈┈"]);
+        assert_eq!(plain("###### D6", 80), vec!["D6", "┉┉"]);
+    }
+
+    #[test]
+    fn heading_levels_extend_beyond_six() {
+        let mut seen = std::collections::HashSet::new();
+        for level in 1..=10 {
+            let glyph = heading_underline(level)
+                .map(|c| c.to_string())
+                .or_else(|| heading_prefix(level));
+            assert!(glyph.is_some(), "level {level} has no decoration");
+            seen.insert(glyph.unwrap());
+        }
+        assert_eq!(seen.len(), 10, "heading decorations must be distinct per level");
     }
 
     #[test]
@@ -913,6 +1018,32 @@ mod tests {
             "│ 中文 │ abc   │",
             "└──────┴───────┘",
         ]);
+    }
+
+    #[test]
+    fn table_wraps_to_terminal_width() {
+        let md = "| name | description |\n| --- | --- |\n| alpha | this is a long description that must wrap |";
+        let out = plain(md, 30);
+        for l in &out {
+            assert!(UnicodeWidthStr::width(l.as_str()) <= 30, "line exceeds width: {:?}", l);
+        }
+        let widths: Vec<usize> =
+            out.iter().map(|l| UnicodeWidthStr::width(l.as_str())).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged table: {:?}", out);
+        assert!(out.len() > 5, "expected wrapped rows: {:?}", out);
+        assert!(out.iter().any(|l| l.contains("alpha")));
+    }
+
+    #[test]
+    fn table_wraps_cjk_without_exceeding_width() {
+        let md = "| 名称 | 说明 |\n| --- | --- |\n| 中文 | 这是一段很长的中文描述内容需要自动换行 |";
+        let out = plain(md, 24);
+        for l in &out {
+            assert!(UnicodeWidthStr::width(l.as_str()) <= 24, "line exceeds width: {:?}", l);
+        }
+        let widths: Vec<usize> =
+            out.iter().map(|l| UnicodeWidthStr::width(l.as_str())).collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "ragged table: {:?}", out);
     }
 
     #[test]
